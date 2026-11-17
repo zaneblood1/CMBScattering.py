@@ -8,4 +8,7 @@ build/
 .venv/
 venv/
 .vscode
-.claude
+#Claude Code's local state is ignored, but the project skills (e.g. /update-docs) are tracked
+.claude/*
+!.claude/skills/
+gaussian_sampler_output/

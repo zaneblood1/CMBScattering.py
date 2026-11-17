@@ -198,14 +198,14 @@ def data_model(cmb_field, dust_field, frequency_scaling, mask, beam):
 #SIMULATION
 ##############################################################
 
-def _draw_field(field_like, covariance, key_e, key_b):
+def draw_field(field_like, covariance, key_e, key_b):
     #one Gaussian E/B draw from a single-channel DiagonalEB covariance, in Fourier space
     nside = field_like.nside
     e_matrix = jfft.rfft2(field_from_covar_single_key(nside, covariance.matrix_EE, key_e))
     b_matrix = jfft.rfft2(field_from_covar_single_key(nside, covariance.matrix_BB, key_b))
     return field_like.replace(polar_matrix_1 = e_matrix, polar_matrix_2 = b_matrix)
 
-def _draw_noise(field_like, noise_covariance, rng_key):
+def draw_noise(field_like, noise_covariance, rng_key):
     #an independent noise draw per channel and per component
     nside = field_like.nside
     num_frequencies = noise_covariance.matrix_EE.shape[0]
@@ -217,6 +217,7 @@ def _draw_noise(field_like, noise_covariance, rng_key):
     return field_like.replace(polar_matrix_1 = jax.vmap(draw)(keys_e, noise_covariance.matrix_EE),
                               polar_matrix_2 = jax.vmap(draw)(keys_b, noise_covariance.matrix_BB))
 
+#TODO add a flag here to switch between gaussian dust and a more advance dust model... Then update all the callers
 def simulate_data(nside, theta_pix, master_seed, r, 
                   dust_amplitude_ee, dust_knee_ee,
                   dust_amplitude_bb, dust_knee_bb,
@@ -264,9 +265,9 @@ def simulate_data(nside, theta_pix, master_seed, r,
                         theta_pix = theta_pix, pix_width = pix_width, basis = Basis.FOURIER,
                         parametrization = Parametrization.EB)
     key_cmb_e, key_cmb_b, key_dust_e, key_dust_b, key_noise = jax.random.split(jax.random.PRNGKey(master_seed), 5)
-    cmb_field = _draw_field(field_like, field_covariance, key_cmb_e, key_cmb_b)
-    dust_field = _draw_field(field_like, dust_covariance, key_dust_e, key_dust_b)
-    noise = _draw_noise(field_like, noise_covariance, key_noise)
+    cmb_field = draw_field(field_like, field_covariance, key_cmb_e, key_cmb_b)
+    dust_field = draw_field(field_like, dust_covariance, key_dust_e, key_dust_b)
+    noise = draw_noise(field_like, noise_covariance, key_noise)
 
     frequency_scaling = dust_frequency_scaling(frequencies, frequency_exponent, dust_temperature)
     data = data_model(cmb_field, dust_field, frequency_scaling, mask, beam) + noise

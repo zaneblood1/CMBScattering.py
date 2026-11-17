@@ -8,6 +8,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Added
 
+- **2026-11-17** `/update-docs`, a project skill (`.claude/skills/update-docs/SKILL.md`) that tells Claude Code how to bring the markdown documentation in line with the code. `.gitignore` now tracks `.claude/skills/` while still ignoring the rest of `.claude/`.
+- **2026-11-17** `docs/sampler_gaussian_dust.ipynb`: an executed guide that simulates one data set at the fiducial parameters, runs the Gaussian dust sampler for 1000 iterations and shows the trace plots, the log-posterior over time, the acceptance rates against the 44 % target, autocorrelation functions and integrated autocorrelation times, and KDE posteriors of the burnt-in, thinned samples with each parameter's mean, standard deviation (from `cmb_lensing.chain_analysis.product_moments`) and z-score.
+- **2026-11-17** The sampler writes a trace plot per sampled parameter (`<out_dir>/<name>_trace.png`, with the true value marked when known), refreshed every `log_every` iterations while the chain runs. Plots are written to a temporary file and renamed into place, so an image viewer watching them does not flicker.
+- **2026-11-17** `cmb_scattering/sampler.py`: `sample_gaussian_posterior`, a Gibbs sampler of the Gaussian dust model. Each iteration draws the CMB field and the dust field with the Hoffman-Ribak algorithm (exact mode-by-mode Wiener filter) and updates the two dust amplitudes, the two dust indices, r and the frequency exponent by sequential 1D random-walk Metropolis. Runs from the terminal with `python -m cmb_scattering.sampler`, writing the sample histories and a log-posterior plot to `gaussian_sampler_output/`. The default proposal widths are hand-tuned to accept close to 44 % on the default configuration.
 - **2026-11-17** `CHANGELOG.md`, `CONTRIBUTING.md`, `PROJECT_SUMMARY.md` (a briefing for AI agents and new contributors) and `CLAUDE.md`.
 - **2026-11-17** `docs/data_generation.ipynb`: an executed guide that simulates a data set on a 42.7 degree patch with 20' pixels and plots the B-mode spectrum of each component and the CMB, dust and data maps.
 - **2026-11-17** The Gaussian prior on the dust frequency exponent (BK18's beta_d = 1.49 +/- 0.13) is part of the log-posterior.
@@ -19,5 +23,6 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Changed
 
+- **2026-11-17** `simulate_dust._draw_field` / `_draw_noise` are public (`draw_field`, `draw_noise`), since the sampler shares them.
 - **2026-11-17** The dust power law is defined in `D_ell = ell (ell + 1) C_ell / (2 pi)`, the BK18 convention, instead of in `C_ell`.
 - **2026-11-17** `frequency_exponent_logprior` is `-(x - mean)^2 / (2 width^2)` with `width` the 1-sigma uncertainty; the first stub divided by `width` once.

@@ -16,8 +16,12 @@ pip install -e ../CMBLensing.py
 #Tests (the user runs these; do not write or run tests unless asked)
 pytest
 
-#Re-execute the guide notebook in place after changing code it uses
+#Re-execute a guide notebook in place after changing code it uses
 jupyter nbconvert --to notebook --execute --inplace docs/data_generation.ipynb
+jupyter nbconvert --to notebook --execute --inplace docs/sampler_gaussian_dust.ipynb
+
+#Run the Gaussian dust sampler from the terminal (see PROJECT_SUMMARY.md for the flags)
+python -m cmb_scattering.sampler --num_iterations 2000
 ```
 
 The working environment on the user's machine is `~/venvs/myenv` (no venv is active in a fresh shell, and the system `python3` has neither package installed). `pip install -e ".[dev]"` replaces an editable `cmb_lensing` with the GitHub copy, so re-run the second command after it.
@@ -25,9 +29,10 @@ The working environment on the user's machine is `~/venvs/myenv` (no venv is act
 ## Working in this repository
 
 - **Tests:** do not write or run tests unless the user asks. Running a script or the notebook to check that new code executes is fine when the task is to produce working output.
+- **Do not edit CMBLensing.py.** If a change there would be the better fix, describe it to the user and leave that repository alone.
 - **Literature values:** look constants up with a web search (read the paper itself when a search summary does not give the number) instead of quoting them from memory. Put a link to the source in a comment next to every constant taken from a paper.
 - **Notebooks:** edit `.ipynb` files through `nbformat` (or the notebook tools), not by hand-editing JSON, and re-execute so the stored outputs match the code. The user often has the notebook open; say when a file was changed on disk.
-- **Docs to keep current:** add an entry to `CHANGELOG.md` for every user-visible change, and update `PROJECT_SUMMARY.md` when the structure, a signature or a convention changes.
+- **Documentation is Claude's job (requested 2026-11-17).** Keep `CHANGELOG.md`, `PROJECT_SUMMARY.md`, this file, `CONTRIBUTING.md` and `README.md` current without being asked: whenever a task changes code, a notebook, a command or a convention, update the affected docs in the same turn, and check them again when the user says they are about to commit. The procedure is the project skill `/update-docs` (`.claude/skills/update-docs/SKILL.md`), which the user can also run by hand. The user edits code and notebooks between turns, so read the current diff first.
 - **File edits:** use the dedicated `Edit` / `Write` tools as the default way to change files, not `sed` or heredocs through `Bash`.
 - **The user renames things.** Function names in `cmb_scattering/` change between sessions (e.g. `gaussian_likelihood` became `gaussian_posterior`). Read the current source before calling or importing anything.
 

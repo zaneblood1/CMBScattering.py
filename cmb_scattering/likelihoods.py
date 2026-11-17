@@ -63,3 +63,7 @@ def frequency_exponent_logprior(frequency_exponent, mean = FREQUENCY_EXPONENT_PR
                                 width = FREQUENCY_EXPONENT_PRIOR_WIDTH):
     #`width` is the 1-sigma uncertainty; the normalization does not depend on the exponent
     return -(frequency_exponent - mean)**2 / (2 * width**2)
+
+#TODO implement a non-gaussian log-posterior which uses the L2-loss of
+#the log of the scattering coefficients of the given dust sample relative to the 
+#log of the scattering coefficients of the ground truth dust field... 

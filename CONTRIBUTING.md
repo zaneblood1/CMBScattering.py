@@ -2,7 +2,7 @@
 
 Thanks for your interest in CMBScattering.py. Bug reports, questions, documentation fixes and code contributions are all welcome. This page explains how to get help, how to report a problem, and how to propose a change.
 
-CMBScattering.py infers the tensor-to-scalar ratio from flat-sky, multi-frequency CMB polarization maps with a dust foreground. It builds on [CMBLensing.py](https://github.com/zaneblood1/CMBLensing.py). `PROJECT_SUMMARY.md` describes the data model, the code layout and the conventions, and `docs/data_generation.ipynb` is a worked example.
+CMBScattering.py infers the tensor-to-scalar ratio from flat-sky, multi-frequency CMB polarization maps with a dust foreground. It builds on [CMBLensing.py](https://github.com/zaneblood1/CMBLensing.py). `PROJECT_SUMMARY.md` describes the data model, the code layout and the conventions. Two executed notebooks are worked examples: `docs/data_generation.ipynb` simulates and plots a data set, and `docs/sampler_gaussian_dust.ipynb` runs the Gaussian dust sampler on one.
 
 ## Getting help
 
@@ -46,20 +46,21 @@ pip install -e ../CMBLensing.py
 pytest
 ```
 
-The test suite currently only checks that the package and its CMBLensing.py dependency import. The simulation and the log-posterior are not covered yet, and contributions there are especially welcome.
+The test suite currently only checks that the package and its CMBLensing.py dependency import. The simulation, the log-posterior and the sampler are not covered yet, and contributions there are especially welcome. The sampler in particular has only been run on short single-map chains; a test that its z-scores scatter with unit width over many maps does not exist.
 
 ## Submitting a pull request
 
 1. Fork the repository and create a branch off `main`.
 2. Keep each pull request focused on one change.
 3. If your change affects numerical results, say how you checked it in the pull request description.
-4. If you change code that `docs/data_generation.ipynb` uses, re-execute the notebook so its outputs match:
+4. If you change code that a notebook in `docs/` uses, re-execute it so its outputs match, and check that its commentary still describes them:
 
    ```bash
    jupyter nbconvert --to notebook --execute --inplace docs/data_generation.ipynb
+   jupyter nbconvert --to notebook --execute --inplace docs/sampler_gaussian_dust.ipynb
    ```
 
-5. Add an entry to `CHANGELOG.md`, and update `PROJECT_SUMMARY.md` if the structure, a function signature or a convention changed.
+5. Add an entry to `CHANGELOG.md`, and update `PROJECT_SUMMARY.md` if the structure, a function signature or a convention changed. If you use Claude Code, `/update-docs` does this.
 6. Open the pull request against `main` and describe what it changes and why.
 
 ## Code style

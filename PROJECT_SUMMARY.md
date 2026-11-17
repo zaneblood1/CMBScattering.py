@@ -12,9 +12,16 @@ Infer the tensor-to-scalar ratio r from flat-sky, multi-frequency CMB polarizati
 |---|---|
 | Gaussian dust simulation (`simulate_dust.py`) | implemented, runs end to end through `docs/data_generation.ipynb` |
 | Gaussian log-posterior (`likelihoods.py`) | implemented, evaluated once on simulated data, not otherwise validated |
-| Sampler (`sampler.py`) | empty file, deliberately not started |
-| Scattering transform statistics, non-Gaussian dust | not started |
+| Gaussian-case sampler (`sampler.py`) | implemented and runs (`docs/sampler_gaussian_dust.ipynb`); NOT validated: only short single-map chains so far |
+| Scattering transform statistics, non-Gaussian dust | not started (see "Planned work") |
 | Tests | two import smoke tests only (`tests/test_import.py`) |
+
+## Planned work
+
+From `#TODO` comments in the source (2026-11-17):
+
+- `simulate_dust.simulate_data`: a flag to switch between the Gaussian dust and a more advanced (non-Gaussian) dust model, with every caller updated.
+- `likelihoods.py`: a non-Gaussian log-posterior built on the L2 loss between the log scattering coefficients of a dust sample and those of the ground-truth dust field.
 
 ## Layout
 
@@ -23,13 +30,19 @@ cmb_scattering/
   __init__.py         empty
   simulate_dust.py    the data model: constants, covariances, dust frequency scaling, simulate_data
   likelihoods.py      gaussian_posterior and the beta_d prior
-  sampler.py          empty
+  sampler.py          sample_gaussian_posterior (Gibbs over f, g and the six parameters) and its CLI
 docs/
   data_generation.ipynb   executed guide: simulate a data set and plot spectra and maps
+  sampler_gaussian_dust.ipynb   executed guide: a 1000-iteration chain on one map, with traces,
+                          acceptance rates, autocorrelation times and KDE posteriors
 tests/
   test_import.py      import smoke tests
+.claude/skills/update-docs/SKILL.md   the /update-docs command (the only tracked part of .claude/)
 pyproject.toml        setuptools build; depends on cmb-lensing (from GitHub), jax, scipy
+README.md, CONTRIBUTING.md, CHANGELOG.md, CLAUDE.md, PROJECT_SUMMARY.md
 ```
+
+The sampler's default output directory, `gaussian_sampler_output/`, is gitignored.
 
 ## The data model
 
@@ -47,6 +60,17 @@ Three frequency channels (default 95 / 150 / 220 GHz), polarization only (E and 
 
 `gaussian_posterior(data_field, cmb_field, dust_field, mask, beam, dust_amplitude_ee, dust_knee_ee, dust_amplitude_bb, dust_knee_bb, frequency_exponent, r, noise_covariance, scalar_covariance, tensor_covariance, ...)` is the joint log-density of the data and the two fields, `-1/2 * [chi^2 terms + log-determinants]`, PLUS the Gaussian prior on `frequency_exponent` (BK18's beta_d = 1.49 +/- 0.13). There is no way to switch the prior off or change it through this function's arguments.
 
+## The sampler
+
+`sampler.sample_gaussian_posterior(data, noise_covariance, scalar_covariance, tensor_covariance, mask, beam, param_init, ...)` Gibbs-samples P(f, g, parameters | d). The parameters are named as everywhere else and updated in `PARAM_ORDER`: `dust_amplitude_ee`, `dust_amplitude_bb`, `dust_knee_ee`, `dust_knee_bb`, `r`, `frequency_exponent`. The dust temperature is fixed. It returns `(sample_histories, acceptance_rates, logposterior_values)`.
+
+- **Field draws** (`gibbs_sample_field`, used for f and then g): Hoffman-Ribak. Simulate a field and noise from their priors, then add `wiener_filter` of (residual data - simulated data). The model has no lensing and the mask and beam are Fourier-diagonal, so the Wiener filter is solved exactly per mode; there is no conjugate gradient. A pixel-space mask would need one.
+- **Parameter updates** (`metropolis_sample_parameter`): 1D random-walk Metropolis on `gaussian_posterior` at the current fields, with flat prior boxes `PARAM_BOUNDS` and widths `DEFAULT_PROPOSAL_WIDTHS` (hand-tuned on the default configuration, see below).
+- **CLI:** `python -m cmb_scattering.sampler --nside 64 --num_iterations 2000 --r_proposal_width 0.01`. Every parameter has `--<name>` (truth of the simulated data, default `DEFAULT_TRUE_PARAMS`), `--<name>_init` and `--<name>_proposal_width`; the defaults are nside 128, 20' pixels and 5000 iterations. Output goes to `--out_dir` (default `gaussian_sampler_output/`): `sample_histories.npz`, the log-posterior plot `logpdf_over_time.png` and one trace plot per sampled parameter (`<name>_trace.png`). Every `--log_every` iterations (default 1, i.e. every iteration) the acceptance rates are printed and the plots rewritten; the plots are written to a temporary file and renamed into place so an image viewer never loads a partial file. Pass a larger `--log_every` for long chains, since each refresh redraws seven figures.
+- **Mixing, measured 2026-11-17** (nside 128, 20', 3 uK-arcmin, default truth; about 36 iterations per second on the user's laptop CPU). r mixes fast (IAT about 6 iterations). The dust parameters and `frequency_exponent` mix slowly: a 6000-iteration chain gave IAT about 60 for the EE dust amplitude and knee, 130 to 220 for the BB ones and about 250 for `frequency_exponent`. A 500-iteration chain therefore underestimates their posterior widths (by a factor of four for `frequency_exponent`) and gives z-scores of 2 to 4 that a longer chain removes. Each of these parameters is updated with the dust field fixed, and the field with the parameters fixed; a parametrization that moves them together (as CMBLensing.py's mixing does) is the likely fix.
+- **Proposal widths** near the 44 % target on that configuration: `dust_amplitude_ee` 0.2, `dust_amplitude_bb` 0.1, both knees 0.02, `r` 0.008, `frequency_exponent` 0.004. These are now `DEFAULT_PROPOSAL_WIDTHS`, which the notebook uses.
+- **Not validated:** no many-map test that z-scores scatter with unit width has been run. One long chain on one map had `dust_amplitude_ee` 2.6 sigma low at about 90 effective samples; unexplained, possibly chance.
+
 ## Representation and conventions
 
 - **Fields** are `cmb_lensing.fields.FlatS2` in EB parametrization and Fourier basis: E in `polar_matrix_1`, B in `polar_matrix_2`, each an `(nside, nside//2+1)` rfft2 array.
@@ -61,6 +85,8 @@ Three frequency channels (default 95 / 150 / 220 GHz), polarization only (E and 
 ## Things that are easy to get wrong
 
 - **The local CMBLensing.py checkout differs from GitHub.** `~/CMBLensing.py` has uncommitted changes, including a temporary change to the key argument of `simulate.field_from_covar`. This package therefore uses `field_from_covar_single_key`, which is the same in both. The declared dependency is the GitHub `master`; `pip install -e ../CMBLensing.py` switches an environment to the local checkout.
+- **Importing `cmb_lensing.chain_analysis` switches matplotlib to Agg.** It calls `matplotlib.use("Agg")` at import time, so figures stop appearing in a notebook. `docs/sampler_gaussian_dust.ipynb` imports `product_moments` / `product_pdf` from it and runs `%matplotlib inline` afterwards to switch back. The clean fix is in CMBLensing.py (move the call into its command-line entry point), which this project does not edit.
+- **Which `cmb_lensing` is installed.** As of 2026-11-17 `~/venvs/myenv` has the local `~/CMBLensing.py` checkout installed in editable mode, not the GitHub copy the dependency declares.
 - **Private imports.** `simulate_dust.py` imports `_run_camb` and `_CAMB_COLS` from `cmb_lensing.simulate`. A rename there breaks `cmb_covariances`.
 - **Scalar times operator.** Write `operator * r`, not `r * operator`, so the operator's own `__mul__` handles a JAX scalar.
 - **Default-sized objects.** A bare `FlatS2()` or `DiagonalEB()` has nside 256 arrays and weights. Always pass `nside`, `theta_pix`, `pix_width` and `fourier_weights = get_fourier_weights((nside, nside//2+1))`, or build from an existing object with `.replace(...)`.
