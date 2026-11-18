@@ -17,8 +17,9 @@ pip install -e ../CMBLensing.py
 pytest
 
 #Re-execute a guide notebook in place after changing code it uses
-jupyter nbconvert --to notebook --execute --inplace docs/data_generation.ipynb
-jupyter nbconvert --to notebook --execute --inplace docs/sampler_gaussian_dust.ipynb
+jupyter nbconvert --to notebook --execute --inplace docs/01_simulating_data.ipynb
+jupyter nbconvert --to notebook --execute --inplace docs/02_sampling_gaussian_dust.ipynb
+jupyter nbconvert --to notebook --execute --inplace docs/03_sampling_pysm_dust.ipynb
 
 #Run the Gaussian dust sampler from the terminal (see PROJECT_SUMMARY.md for the flags)
 python -m cmb_scattering.sampler --num_iterations 2000

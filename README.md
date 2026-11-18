@@ -20,13 +20,20 @@ import cmb_lensing
 
 The package currently implements a Gaussian dust model: a simulator of three-frequency E + B maps, its log-posterior, and a Gibbs sampler for r and the dust parameters. The scattering transform statistics are not implemented yet.
 
-- [`docs/data_generation.ipynb`](docs/data_generation.ipynb) simulates a data set and plots its spectra and maps.
-- [`docs/sampler_gaussian_dust.ipynb`](docs/sampler_gaussian_dust.ipynb) runs the sampler on one simulated map and analyses the chain.
+- [`docs/01_simulating_data.ipynb`](docs/01_simulating_data.ipynb) simulates a data set and plots its spectra and maps, then shows how the non-Gaussian PySM dust is made (full-sky map, mask, patch, taper). Its last section needs the `pysm` extra.
+- [`docs/02_sampling_gaussian_dust.ipynb`](docs/02_sampling_gaussian_dust.ipynb) runs the sampler on one simulated map and analyses the chain.
+- [`docs/03_sampling_pysm_dust.ipynb`](docs/03_sampling_pysm_dust.ipynb) runs the same Gaussian sampler on data with non-Gaussian PySM dust and on matched Gaussian dust, and compares the recovered r.
 
 The sampler also runs from the terminal, simulating its own data. Trace plots and the sample histories go to `gaussian_sampler_output/`:
 
 ```bash
 python -m cmb_scattering.sampler --num_iterations 2000 --log_every 100
+```
+
+To test the Gaussian sampler on non-Gaussian dust, the simulated data can use a PySM dust map of the real sky instead (`simulate_data(..., dust_model = "pysm")`, or `--dust_model pysm` on the sampler). This needs the optional PySM dependencies and downloads PySM's dust template on first use:
+
+```bash
+pip install -e ".[pysm]"
 ```
 
 `python -m cmb_scattering.sampler --help` lists every option. The sampler has only been run on short single-map chains and is not yet validated.

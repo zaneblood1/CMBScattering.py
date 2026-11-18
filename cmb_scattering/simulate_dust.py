@@ -12,11 +12,14 @@ mask and the beam) carries a leading frequency axis, (n_freq, nside, nside//2+1)
 and operator arithmetic of cmb_lensing is element-wise, so it broadcasts over that axis.
 """
 
+from functools import lru_cache
 import jax
 import jax.numpy as jnp
 import jax.numpy.fft as jfft
+import numpy as np
 jax.config.update("jax_enable_x64", True)
 import scipy.constants
+from scipy.signal.windows import tukey
 from cmb_lensing.constants import (ARCMIN_PER_DEGREE, CAMB_LMAX, DEFAULT_A_LENSE,
                                    DEFAULT_K_PIVOT, DEFAULT_MAX_ELL, DEFAULT_MNU,
                                    DEFAULT_TAUREIO, GROUND_TRUTH, Basis, Parametrization)
@@ -56,6 +59,29 @@ GHZ_TO_HZ = 1e9
 DEFAULT_UK_ARCMIN = 3.0
 #the E and B components of every covariance, in that order
 POLARIZATION_COMPONENTS = ("EE", "BB")
+
+#the dust of the simulated data: a Gaussian random field with a power-law spectrum, or a
+#PySM dust map (real-sky, non-Gaussian) projected onto the flat patch
+GAUSSIAN_DUST = "gaussian"
+PYSM_DUST = "pysm"
+DUST_MODELS = (GAUSSIAN_DUST, PYSM_DUST)
+#the PySM dust model: d9 is the Planck GNILC based model with one spectral index and one
+#temperature over the whole sky (https://pysm3.readthedocs.io/en/latest/models/)
+DEFAULT_PYSM_PRESET = "d9"
+#centre of the PySM patch: the BICEP/Keck field, RA 0h, Dec -57.5 deg (BK18,
+#https://arxiv.org/abs/2110.00483)
+PYSM_PATCH_CENTER_RA_DEG = 0.0
+PYSM_PATCH_CENTER_DEC_DEG = -57.5
+#the healpix maps the patch is read from have at least this many pixels per flat pixel width
+HEALPIX_PIXELS_PER_FLAT_PIXEL = 2
+#fraction of the patch width over which the PySM dust is tapered to zero (both edges together)
+PYSM_TAPER_FRACTION = 0.2
+#the Galactic plane is removed before the E / B split on the sphere: the PySM maps are
+#multiplied by zero below the first Galactic latitude (degrees), by one above the second,
+#and by a cosine ramp in between. The patch must lie above the second
+GALACTIC_MASK_ZERO_LATITUDE_DEG = 15.0
+GALACTIC_MASK_FULL_LATITUDE_DEG = 30.0
+DEGREES_PER_RADIAN = 180 / np.pi
 
 ##############################################################
 #COVARIANCES
@@ -195,6 +221,108 @@ def data_model(cmb_field, dust_field, frequency_scaling, mask, beam):
     return mask * beam * (dust_by_frequency + cmb_field)
 
 ##############################################################
+#PYSM DUST
+##############################################################
+
+def galactic_plane_mask(healpix_nside):
+    """A healpix map that is zero in the Galactic plane, one at high Galactic latitude and a
+    cosine ramp in between (the GALACTIC_MASK_* latitudes)."""
+    import healpy
+
+    colatitude, _ = healpy.pix2ang(healpix_nside, np.arange(healpy.nside2npix(healpix_nside)))
+    latitude_deg = np.abs(90 - colatitude * DEGREES_PER_RADIAN)
+    ramp = np.clip((latitude_deg - GALACTIC_MASK_ZERO_LATITUDE_DEG)
+                   / (GALACTIC_MASK_FULL_LATITUDE_DEG - GALACTIC_MASK_ZERO_LATITUDE_DEG), 0, 1)
+    return (1 - np.cos(np.pi * ramp)) / 2
+
+@lru_cache(maxsize = None)
+def pysm_dust_eb_maps(preset, healpix_nside, lmin, lmax):
+    """(E map, B map): the PySM dust polarization at 353 GHz as two scalar healpix maps in
+    uK_CMB and Galactic coordinates, holding only the multipoles lmin <= ell <= lmax.
+
+    The E / B split is done on the sphere, so no patch edge can leak E into B. Scalar E and
+    B maps are non-local, though: the Galactic plane is a thousand times brighter than the
+    high-latitude sky and would dominate the E map far from it, so it is masked first
+    (galactic_plane_mask). Cached, because the PySM templates do not depend on the seed. The
+    first call downloads the templates into the astropy cache.
+    """
+    import healpy
+    import pysm3
+    import pysm3.units as units
+
+    sky = pysm3.Sky(nside = healpix_nside, preset_strings = [preset], output_unit = units.uK_CMB)
+    stokes_maps = sky.get_emission(DUST_REFERENCE_FREQUENCY_GHZ * units.GHz).value
+    _, alm_e, alm_b = healpy.map2alm(stokes_maps * galactic_plane_mask(healpix_nside), lmax = lmax)
+    keep_multipoles = (np.arange(lmax + 1) >= lmin).astype(float)
+    e_map = healpy.alm2map(healpy.almxfl(alm_e, keep_multipoles), healpix_nside, lmax = lmax, pol = False)
+    b_map = healpy.alm2map(healpy.almxfl(alm_b, keep_multipoles), healpix_nside, lmax = lmax, pol = False)
+    return e_map, b_map
+
+def flat_patch_sky_coordinates(nside, theta_pix, center_ra_deg = PYSM_PATCH_CENTER_RA_DEG,
+                               center_dec_deg = PYSM_PATCH_CENTER_DEC_DEG):
+    """Galactic (longitude, latitude) in degrees of every pixel of the flat patch.
+
+    The patch is laid out as a longitude / latitude grid about the equator of a frame whose
+    origin is the patch centre, which is only undistorted near that centre.
+    """
+    import healpy
+    from astropy.coordinates import SkyCoord
+
+    center = SkyCoord(ra = center_ra_deg, dec = center_dec_deg, unit = "deg").galactic
+    offsets_deg = (np.arange(nside) - nside / 2) * theta_pix / ARCMIN_PER_DEGREE
+    local_longitude, local_latitude = np.meshgrid(offsets_deg, offsets_deg)
+    #the rotator takes the patch centre to (0, 0), so its inverse takes local to Galactic
+    to_local_frame = healpy.Rotator(rot = [center.l.deg, center.b.deg], deg = True)
+    longitude, latitude = to_local_frame.I(local_longitude.ravel(), local_latitude.ravel(),
+                                           lonlat = True)
+    return longitude.reshape(nside, nside), latitude.reshape(nside, nside)
+
+def edge_taper(nside, taper_fraction = PYSM_TAPER_FRACTION):
+    """An nside x nside window that is one in the middle of the patch and falls smoothly to
+    zero at its edges, which makes a cut-out of the sky periodic on the FFT grid."""
+    window = tukey(nside, alpha = taper_fraction)
+    return np.outer(window, window)
+
+def pysm_dust_field(field_like, preset = DEFAULT_PYSM_PRESET,
+                    taper_fraction = PYSM_TAPER_FRACTION):
+    """The PySM dust at 353 GHz on the flat patch of `field_like`, as a FlatS2 in Fourier
+    space (uK_CMB).
+
+    The E and B healpix maps are read at the patch's pixels, their mean over the patch is
+    removed and they are tapered to zero at its edges. Only the multipoles the flat grid can
+    hold are kept, from the patch's fundamental to its Nyquist multipole. The dust is the
+    real sky's, so it is the same on every call. healpy's sign convention
+    for B need not match cmb_lensing's; nothing at the power-spectrum level depends on it.
+    """
+    import healpy
+
+    #We need to achieve a higher resolution on the curved sky than our target resolution on the flat
+    #sky (called "oversampling") in order to avoid projection effects / numerical artifacts
+    nside, theta_pix = field_like.nside, field_like.theta_pix
+    healpix_nside = 1
+    while healpy.nside2resol(healpix_nside, arcmin = True) > theta_pix / HEALPIX_PIXELS_PER_FLAT_PIXEL:
+        healpix_nside *= 2
+    #the fundamental and the Nyquist multipole of the flat grid: nothing outside them can be
+    #represented there
+    lmin = int(2 * np.pi / (nside * field_like.pix_width))
+    lmax = int(np.pi / field_like.pix_width)
+    e_healpix, b_healpix = pysm_dust_eb_maps(preset, healpix_nside, lmin, lmax)
+
+    longitude, latitude = flat_patch_sky_coordinates(nside, theta_pix)
+    taper = edge_taper(nside, taper_fraction)
+
+    def flat_fourier_matrix(healpix_map):
+        flat_map = healpy.get_interp_val(healpix_map, longitude, latitude, lonlat = True)
+        #remove the patch's mean before tapering, or the taper would turn it into a
+        #patch-sized plateau of spurious large-scale power
+        flat_map = flat_map - np.sum(flat_map * taper) / np.sum(taper)
+        #no power in the mean of the map, like every field the model draws
+        return jfft.rfft2(jnp.asarray(flat_map * taper)).at[0, 0].set(0.0)
+
+    return field_like.replace(polar_matrix_1 = flat_fourier_matrix(e_healpix),
+                              polar_matrix_2 = flat_fourier_matrix(b_healpix))
+
+##############################################################
 #SIMULATION
 ##############################################################
 
@@ -217,13 +345,13 @@ def draw_noise(field_like, noise_covariance, rng_key):
     return field_like.replace(polar_matrix_1 = jax.vmap(draw)(keys_e, noise_covariance.matrix_EE),
                               polar_matrix_2 = jax.vmap(draw)(keys_b, noise_covariance.matrix_BB))
 
-#TODO add a flag here to switch between gaussian dust and a more advance dust model... Then update all the callers
-def simulate_data(nside, theta_pix, master_seed, r, 
-                  dust_amplitude_ee, dust_knee_ee,
-                  dust_amplitude_bb, dust_knee_bb,
-                  frequency_exponent, uk_arcmin = DEFAULT_UK_ARCMIN,
+def simulate_data(nside, theta_pix, master_seed, r, frequency_exponent,
+                  dust_amplitude_ee = None, dust_knee_ee = None,
+                  dust_amplitude_bb = None, dust_knee_bb = None,
+                  uk_arcmin = DEFAULT_UK_ARCMIN,
                   frequencies = FREQUENCIES_GHZ, dust_temperature = DUST_TEMPERATURE_K,
-                  params = GROUND_TRUTH):
+                  params = GROUND_TRUTH, dust_model = GAUSSIAN_DUST,
+                  pysm_preset = DEFAULT_PYSM_PRESET):
     """Simulate multi-frequency E + B data on a flat nside x nside patch.
 
     Args:
@@ -231,31 +359,35 @@ def simulate_data(nside, theta_pix, master_seed, r,
         theta_pix: Pixel width in arcmin.
         master_seed: Root seed of every random draw.
         r: Tensor-to-scalar ratio.
+        frequency_exponent: beta_d of the dust modified blackbody, which scales the dust
+            between the channels in both dust models.
         dust_amplitude_ee: Dust EE D_l = l (l + 1) C_l / (2 pi) at ell = 80 and 353 GHz,
-            in uK_CMB^2.
+            in uK_CMB^2. Gaussian dust only, like the three parameters below.
         dust_knee_ee: Power-law index of the dust EE D_l.
         dust_amplitude_bb: The same for BB (BK18's A_d).
         dust_knee_bb: Power-law index of the dust BB D_l (BK18's alpha_d).
-        frequency_exponent: beta_d of the dust modified blackbody.
         uk_arcmin: Polarization white noise level of every channel, in uK-arcmin.
         frequencies: The channels, in GHz.
         dust_temperature: T_d of the dust modified blackbody, in K.
         params: The LCDM parameters of the CMB spectra.
+        dust_model: "gaussian" draws the dust as a Gaussian field with the power-law
+            spectra above. "pysm" takes the 353 GHz dust of a PySM model on the BICEP/Keck
+            field (pysm_dust_field): non-Gaussian, and the same on every call, so the seed
+            then only changes the CMB and the noise.
+        pysm_preset: The PySM dust model of dust_model = "pysm".
 
     Returns:
         A dict with the fields `data` (leading frequency axis), `cmb_field` and `dust_field`,
         the operators `noise_covariance`, `scalar_covariance`, `tensor_covariance`,
-        `field_covariance`, `dust_covariance`, `mask` and `beam`, and `frequencies` /
-        `frequency_scaling`. All fields are in Fourier space.
+        `field_covariance`, `dust_covariance` (None for PySM dust), `mask` and `beam`,
+        `frequencies` / `frequency_scaling`, and `dust_model`. All fields are in Fourier
+        space.
     """
     ell_grid, pix_width = gen_ell_grid(nside, theta_pix)
     frequencies = jnp.asarray(frequencies, dtype = jnp.float64)
 
     scalar_covariance, tensor_covariance = cmb_covariances(nside, theta_pix, params)
     field_covariance = cmb_field_covariance_from_r(r, scalar_covariance, tensor_covariance)
-    dust_covariance = dust_covariance_operator_like(dust_amplitude_ee, dust_knee_ee,
-                                                    dust_amplitude_bb, dust_knee_bb,
-                                                    scalar_covariance)
     noise_covariance = white_noise_covariance(nside, theta_pix, uk_arcmin, frequencies.shape[0])
     #identity for now: a per-channel mask or beam is a block with a leading frequency axis
     mask = get_identity_like(scalar_covariance)
@@ -266,8 +398,17 @@ def simulate_data(nside, theta_pix, master_seed, r,
                         parametrization = Parametrization.EB)
     key_cmb_e, key_cmb_b, key_dust_e, key_dust_b, key_noise = jax.random.split(jax.random.PRNGKey(master_seed), 5)
     cmb_field = draw_field(field_like, field_covariance, key_cmb_e, key_cmb_b)
-    dust_field = draw_field(field_like, dust_covariance, key_dust_e, key_dust_b)
     noise = draw_noise(field_like, noise_covariance, key_noise)
+
+    #the dust at the reference frequency
+    if dust_model == PYSM_DUST:
+        dust_covariance = None
+        dust_field = pysm_dust_field(field_like, pysm_preset)
+    else:
+        dust_covariance = dust_covariance_operator_like(dust_amplitude_ee, dust_knee_ee,
+                                                        dust_amplitude_bb, dust_knee_bb,
+                                                        scalar_covariance)
+        dust_field = draw_field(field_like, dust_covariance, key_dust_e, key_dust_b)
 
     frequency_scaling = dust_frequency_scaling(frequencies, frequency_exponent, dust_temperature)
     data = data_model(cmb_field, dust_field, frequency_scaling, mask, beam) + noise
@@ -276,4 +417,5 @@ def simulate_data(nside, theta_pix, master_seed, r,
             "noise_covariance": noise_covariance, "scalar_covariance": scalar_covariance,
             "tensor_covariance": tensor_covariance, "field_covariance": field_covariance,
             "dust_covariance": dust_covariance, "mask": mask, "beam": beam,
-            "frequencies": frequencies, "frequency_scaling": frequency_scaling}
+            "frequencies": frequencies, "frequency_scaling": frequency_scaling,
+            "dust_model": dust_model}

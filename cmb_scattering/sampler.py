@@ -31,7 +31,8 @@ jax.config.update("jax_enable_x64", True)
 from matplotlib.figure import Figure
 from cmb_lensing.matrix_operators import get_identity_like, pinv
 from cmb_scattering.likelihoods import FREQUENCY_EXPONENT_PRIOR_MEAN, gaussian_posterior
-from cmb_scattering.simulate_dust import (DEFAULT_UK_ARCMIN, DUST_TEMPERATURE_K,
+from cmb_scattering.simulate_dust import (DEFAULT_PYSM_PRESET, DEFAULT_UK_ARCMIN,
+                                          DUST_MODELS, DUST_TEMPERATURE_K, GAUSSIAN_DUST,
                                           FREQUENCIES_GHZ, PLANCK_DUST_KNEE_BB,
                                           PLANCK_DUST_KNEE_EE,
                                           PLANCK_DUST_BB_TO_EE_AMPLITUDE_RATIO,
@@ -82,6 +83,10 @@ DEFAULT_TRUE_PARAMS = {
     "r": DEFAULT_R,
     "frequency_exponent": FREQUENCY_EXPONENT_PRIOR_MEAN,
 }
+
+#the parameters that are still inputs of the simulation, and so have a true value, when the
+#dust comes from PySM
+PYSM_TRUE_PARAMS = ["r", "frequency_exponent"]
 
 DEFAULT_NSIDE = 128
 DEFAULT_THETA_PIX = 20.0
@@ -224,12 +229,12 @@ def plot_logposterior(logposterior_values, path):
 
 def plot_parameter_traces(sample_histories, names, out_dir, true_params = None):
     """Save one trace plot per parameter in `names`, <out_dir>/<name>_trace.png, from the
-    samples drawn so far. `true_params` adds a line at each parameter's true value."""
+    samples drawn so far. `true_params` adds a line at the true value of each parameter it holds."""
     for name in names:
         figure = Figure(figsize = TRACE_FIGURE_SIZE)
         axis = figure.subplots()
         axis.plot(sample_histories[name], label = "chain")
-        if true_params is not None:
+        if true_params is not None and name in true_params:
             axis.axhline(true_params[name], color = "black", linestyle = "--", label = "truth")
             axis.legend()
         axis.set_title(f"{name} over time")
@@ -357,8 +362,9 @@ def sample_gaussian_posterior(data, noise_covariance, scalar_covariance, tensor_
 
 def parse_arguments():
     parser = argparse.ArgumentParser(
-        description = "Simulate multi-frequency E + B data with Gaussian dust and "
-                      "Gibbs-sample r and the dust parameters from it.")
+        description = "Simulate multi-frequency E + B data with Gaussian or PySM dust and "
+                      "Gibbs-sample r and the dust parameters from it with the Gaussian "
+                      "dust model.")
     parser.add_argument("--nside", type = int, default = DEFAULT_NSIDE,
                         help = "number of pixels on a side")
     parser.add_argument("--theta_pix", type = float, default = DEFAULT_THETA_PIX,
@@ -377,9 +383,17 @@ def parse_arguments():
                         help = "iterations between acceptance-rate printouts and plot updates")
     parser.add_argument("--out_dir", type = str, default = DEFAULT_OUT_DIR,
                         help = "directory the sample histories and the log-posterior plot go to")
+    parser.add_argument("--dust_model", type = str, choices = DUST_MODELS,
+                        default = GAUSSIAN_DUST,
+                        help = "dust of the simulated data: a Gaussian field, or a PySM dust "
+                               "map (non-Gaussian) on the BICEP/Keck field")
+    parser.add_argument("--pysm_preset", type = str, default = DEFAULT_PYSM_PRESET,
+                        help = "PySM dust model of --dust_model pysm")
     for name in PARAM_ORDER:
         parser.add_argument(f"--{name}", type = float, default = DEFAULT_TRUE_PARAMS[name],
-                            help = f"true {name} of the simulated data")
+                            help = f"true {name} of the simulated data (with PySM dust the "
+                                   f"dust amplitudes and knees have no true value and this "
+                                   f"only sets the chain's default starting point)")
         parser.add_argument(f"--{name}_init", type = float, default = None,
                             help = f"starting {name} of the chain (default: the true value)")
         parser.add_argument(f"--{name}_proposal_width", type = float,
@@ -392,16 +406,22 @@ if __name__ == "__main__":
     arguments = vars(parse_arguments())
     os.makedirs(arguments["out_dir"], exist_ok = True)
 
-    #the truth of the simulated data, the chain's starting point and its proposal widths
-    true_params = {name: arguments[name] for name in PARAM_ORDER}
-    param_init = {name: true_params[name] if arguments[f"{name}_init"] is None
+    #the chain's starting point and its proposal widths
+    param_init = {name: arguments[name] if arguments[f"{name}_init"] is None
                   else arguments[f"{name}_init"] for name in PARAM_ORDER}
     proposal_widths = {name: arguments[f"{name}_proposal_width"] for name in PARAM_ORDER}
+
+    #the truth of the simulated data. PySM dust is not drawn from the power-law model, so
+    #the dust amplitudes and knees are then not inputs of the simulation and have no truth
+    true_names = PARAM_ORDER if arguments["dust_model"] == GAUSSIAN_DUST else PYSM_TRUE_PARAMS
+    true_params = {name: arguments[name] for name in true_names}
 
     #generate a "ground truth" simulated data set
     sim = simulate_data(arguments["nside"], arguments["theta_pix"], arguments["map_seed"],
                         uk_arcmin = arguments["uk_arcmin"],
-                        dust_temperature = arguments["dust_temperature"], **true_params)
+                        dust_temperature = arguments["dust_temperature"],
+                        dust_model = arguments["dust_model"],
+                        pysm_preset = arguments["pysm_preset"], **true_params)
 
     #run the sampling algorithm
     sample_histories, acceptance_rates, logposterior_values = sample_gaussian_posterior(
@@ -419,7 +439,8 @@ if __name__ == "__main__":
     np.savez(os.path.join(arguments["out_dir"], SAMPLE_HISTORIES_FILE),
              logposterior = logposterior_values, **sample_histories)
     for name in PARAM_ORDER:
-        print(f"{name}: truth = {true_params[name]:.4g}, "
+        truth = f"{true_params[name]:.4g}" if name in true_params else "none"
+        print(f"{name}: truth = {truth}, "
               f"mean = {np.mean(sample_histories[name]):.4g}, "
               f"std = {np.std(sample_histories[name]):.4g}, "
               f"acceptance rate = {acceptance_rates[name]:.2f}")

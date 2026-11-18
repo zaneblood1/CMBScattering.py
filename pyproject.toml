@@ -23,6 +23,11 @@ dev = [
     "pytest>=7.0",
     "jupyter>=1.0",
 ]
+#PySM dust maps for simulate_data(dust_model = "pysm")
+pysm = [
+    "pysm3>=3.4",
+    "healpy>=1.16",
+]
 
 [project.urls]
 Repository = "https://github.com/zaneblood1/CMBScattering.py"
