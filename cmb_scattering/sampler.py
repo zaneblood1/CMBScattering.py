@@ -19,6 +19,12 @@ Run from the terminal with, e.g.,
 
     python -m cmb_scattering.sampler --nside 64 --num_iterations 2000 --r_proposal_width 0.01
 
+sample_scattering_posterior samples the non-Gaussian model of
+likelihoods.scattering_posterior instead, in which the dust prior is an L2 loss on the
+log scattering coefficients of g. The CMB draw is unchanged, the dust field is no longer
+Gaussian given the rest and is updated with a Hamiltonian Monte Carlo step
+(hmc_sample_dust), and only r and frequency_exponent are left as parameters.
+
 The dust temperature is held fixed throughout.
 """
 
@@ -26,11 +32,13 @@ import argparse
 import os
 import jax
 import jax.numpy as jnp
+import jax.numpy.fft as jfft
 import numpy as np
 jax.config.update("jax_enable_x64", True)
 from matplotlib.figure import Figure
 from cmb_lensing.matrix_operators import get_identity_like, pinv
-from cmb_scattering.likelihoods import FREQUENCY_EXPONENT_PRIOR_MEAN, gaussian_posterior
+from cmb_scattering.likelihoods import (DEFAULT_SCATTERING_WIDTH, FREQUENCY_EXPONENT_PRIOR_MEAN,
+                                        gaussian_posterior, scattering_posterior)
 from cmb_scattering.simulate_dust import (DEFAULT_PYSM_PRESET, DEFAULT_UK_ARCMIN,
                                           DUST_MODELS, DUST_TEMPERATURE_K, GAUSSIAN_DUST,
                                           FREQUENCIES_GHZ, PLANCK_DUST_KNEE_BB,
@@ -67,6 +75,20 @@ DEFAULT_PROPOSAL_WIDTHS = {
     "r": 0.008,
     "frequency_exponent": 0.004,
 }
+
+#the parameters of the scattering transform posterior, which has no dust amplitudes or knees
+SCATTERING_PARAM_ORDER = ["r", "frequency_exponent"]
+#Metropolis proposal widths of sample_scattering_posterior, hand-tuned on PySM d9 dust
+DEFAULT_SCATTERING_PROPOSAL_WIDTHS = {
+    "r": 0.008,
+    "frequency_exponent": 0.002,
+}
+#leapfrog steps and step size of the dust field's HMC update. The mass matrix is the
+#data's precision on the dust, so a step size of one is one natural time unit of every mode
+DEFAULT_HMC_NUM_STEPS = 10
+DEFAULT_HMC_STEP_SIZE = 0.15
+#the name the dust field's HMC acceptance rate is reported under
+DUST_FIELD_NAME = "dust_field"
 
 #default truth of the simulated data in __main__. The BB dust amplitude is BK18's best fit
 #A_d = 4.4 uK^2 (https://arxiv.org/abs/2110.00483) and the EE amplitude follows it through
@@ -124,6 +146,17 @@ def sum_over_frequencies(field_or_operator):
                for name in field_or_operator._matrix_names()}
     return field_or_operator.replace(**updates)
 
+def inverse_noise_power(noise_covariance, mask, beam, frequency_weights):
+    """sum_freq R N^-1 R with R_freq = frequency_weights_freq * M * B: the precision the
+    data alone puts on a field that enters channel `freq` through R_freq."""
+    response = scale_by_frequency(mask * beam, frequency_weights)
+    return sum_over_frequencies(response * pinv(noise_covariance) * response)
+
+def inverse_noise_weighted_data(data, noise_covariance, mask, beam, frequency_weights):
+    """sum_freq R N^-1 data_freq with R_freq = frequency_weights_freq * M * B."""
+    response = scale_by_frequency(mask * beam, frequency_weights)
+    return sum_over_frequencies(response * (pinv(noise_covariance) * data))
+
 def wiener_filter(data, prior_covariance, noise_covariance, mask, beam, frequency_weights):
     """Wiener filter of multi-frequency data for a field x with x ~ N(0, C) and
     data_freq = R_freq * x + n_freq, where R_freq = frequency_weights_freq * M * B.
@@ -133,11 +166,10 @@ def wiener_filter(data, prior_covariance, noise_covariance, mask, beam, frequenc
     with no prior power come out exactly zero. The mask and the beam are taken to be real
     and diagonal in Fourier space, so the solve is exact.
     """
-    response = scale_by_frequency(mask * beam, frequency_weights)
-    inverse_noise = pinv(noise_covariance)
-    inverse_noise_power = sum_over_frequencies(response * inverse_noise * response)
-    weighted_data = sum_over_frequencies(response * (inverse_noise * data))
-    denominator = get_identity_like(prior_covariance) + prior_covariance * inverse_noise_power
+    data_precision = inverse_noise_power(noise_covariance, mask, beam, frequency_weights)
+    weighted_data = inverse_noise_weighted_data(data, noise_covariance, mask, beam,
+                                                frequency_weights)
+    denominator = get_identity_like(prior_covariance) + prior_covariance * data_precision
     return pinv(denominator) * (prior_covariance * weighted_data)
 
 @jax.jit
@@ -162,12 +194,95 @@ def gibbs_sample_field(data_residual, prior_covariance, noise_covariance, mask, 
                                noise_covariance, mask, beam, frequency_weights)
     return simulated_field + correction
 
+def least_squares_dust_field(data, noise_covariance, mask, beam, frequency_scaling):
+    """(dust field, its covariance) of the joint least-squares fit of a CMB field and a dust
+    field to the data, with no prior on either. The scattering sampler starts from a draw
+    about this fit.
+
+    Solves the 2 x 2 normal equations of (f, g) mode by mode. The covariance is a DiagonalEB.
+    """
+    cmb_frequency_weights = jnp.ones_like(frequency_scaling)
+    cmb_precision = inverse_noise_power(noise_covariance, mask, beam, cmb_frequency_weights)
+    dust_precision = inverse_noise_power(noise_covariance, mask, beam, frequency_scaling)
+    #inverse_noise_power squares its weights, so sqrt(a_freq) gives the cross term sum_freq a_freq R N^-1 R
+    cross_precision = inverse_noise_power(noise_covariance, mask, beam,
+                                          jnp.sqrt(frequency_scaling))
+    cmb_weighted_data = inverse_noise_weighted_data(data, noise_covariance, mask, beam,
+                                                    cmb_frequency_weights)
+    dust_weighted_data = inverse_noise_weighted_data(data, noise_covariance, mask, beam,
+                                                     frequency_scaling)
+    determinant = cmb_precision * dust_precision - cross_precision * cross_precision
+    dust_estimate = pinv(determinant) * (cmb_precision * dust_weighted_data
+                                         - cross_precision * cmb_weighted_data)
+    return dust_estimate, pinv(determinant) * cmb_precision
+
+def field_to_maps(field):
+    """The real-space E and B maps of a single-channel Fourier field, shape (2, nside, nside)."""
+    return jnp.stack([jfft.irfft2(field.polar_matrix_1), jfft.irfft2(field.polar_matrix_2)])
+
+def maps_to_field(maps, field_like):
+    """Inverse of field_to_maps."""
+    return field_like.replace(polar_matrix_1 = jfft.rfft2(maps[0]),
+                              polar_matrix_2 = jfft.rfft2(maps[1]))
+
+@jax.jit
+def hmc_sample_dust(dust_field, cmb_field, params, data, mask, beam, noise_covariance,
+                    scalar_covariance, tensor_covariance, target_log_scattering_coefficients,
+                    scattering_width, frequencies, dust_temperature, mass_matrix,
+                    num_steps, step_size, rng_key):
+    """One Hamiltonian Monte Carlo update of the dust field on scattering_posterior, with
+    the CMB field and the parameters fixed. Returns (dust field, whether it was accepted).
+
+    The position is the pair of real-space dust maps, so the gradient is a plain jax.grad.
+    `mass_matrix` is a DiagonalEB: the momentum is drawn from N(0, mass_matrix) and the
+    velocity is mass_matrix^-1 * momentum. The mean of each map has no mass and never moves.
+    """
+    key_e, key_b, key_accept = jax.random.split(rng_key, 3)
+    inverse_mass = pinv(mass_matrix)
+
+    def logposterior(dust_maps):
+        return scattering_posterior(data, cmb_field, maps_to_field(dust_maps, dust_field),
+                                    mask, beam, noise_covariance = noise_covariance,
+                                    scalar_covariance = scalar_covariance,
+                                    tensor_covariance = tensor_covariance,
+                                    target_log_scattering_coefficients = target_log_scattering_coefficients,
+                                    scattering_width = scattering_width,
+                                    frequencies = frequencies,
+                                    dust_temperature = dust_temperature, **params)
+
+    gradient = jax.grad(logposterior)
+
+    def velocity(momentum):
+        return field_to_maps(inverse_mass * maps_to_field(momentum, dust_field))
+
+    def hamiltonian(dust_maps, momentum):
+        return logposterior(dust_maps) - jnp.sum(momentum * velocity(momentum)) / 2
+
+    #leapfrog integration: half a momentum kick, then alternate full position and momentum
+    #steps; the last momentum kick is cut back to half a step afterwards
+    def leapfrog_step(_, state):
+        dust_maps, momentum = state
+        dust_maps = dust_maps + step_size * velocity(momentum)
+        momentum = momentum + step_size * gradient(dust_maps)
+        return dust_maps, momentum
+
+    start_maps = field_to_maps(dust_field)
+    start_momentum = field_to_maps(draw_field(dust_field, mass_matrix, key_e, key_b))
+    momentum = start_momentum + step_size * gradient(start_maps) / 2
+    end_maps, momentum = jax.lax.fori_loop(0, num_steps, leapfrog_step, (start_maps, momentum))
+    end_momentum = momentum - step_size * gradient(end_maps) / 2
+
+    #a non-finite Hamiltonian makes the comparison False, so the step is rejected
+    hamiltonian_change = hamiltonian(end_maps, end_momentum) - hamiltonian(start_maps, start_momentum)
+    accepted = jnp.log(jax.random.uniform(key_accept)) < hamiltonian_change
+    return maps_to_field(jnp.where(accepted, end_maps, start_maps), dust_field), accepted
+
 ##############################################################
 #PARAMETER UPDATES
 ##############################################################
 
 @jax.jit
-def eval_logposterior(params, cmb_field, dust_field, data, mask, beam, noise_covariance,
+def eval_gaussian_logposterior(params, cmb_field, dust_field, data, mask, beam, noise_covariance,
                       scalar_covariance, tensor_covariance, frequencies, dust_temperature):
     """gaussian_posterior at a {name: value} dict of the six parameters."""
     return gaussian_posterior(data, cmb_field, dust_field, mask, beam,
@@ -176,6 +291,21 @@ def eval_logposterior(params, cmb_field, dust_field, data, mask, beam, noise_cov
                               tensor_covariance = tensor_covariance,
                               frequencies = frequencies, dust_temperature = dust_temperature,
                               **params)
+
+@jax.jit
+def eval_scattering_logposterior(params, cmb_field, dust_field, data, mask, beam,
+                                 noise_covariance, scalar_covariance, tensor_covariance,
+                                 target_log_scattering_coefficients, scattering_width,
+                                 frequencies, dust_temperature):
+    """scattering_posterior at a {name: value} dict of r and frequency_exponent."""
+    return scattering_posterior(data, cmb_field, dust_field, mask, beam,
+                                noise_covariance = noise_covariance,
+                                scalar_covariance = scalar_covariance,
+                                tensor_covariance = tensor_covariance,
+                                target_log_scattering_coefficients = target_log_scattering_coefficients,
+                                scattering_width = scattering_width,
+                                frequencies = frequencies, dust_temperature = dust_temperature,
+                                **params)
 
 def metropolis_sample_parameter(logposterior_at, name, params, logposterior, bounds,
                                 proposal_width, acceptance, rng_key):
@@ -329,7 +459,7 @@ def sample_gaussian_posterior(data, noise_covariance, scalar_covariance, tensor_
 
         #3. update the parameters one at a time at the new fields
         def logposterior_at(proposed_params):
-            return eval_logposterior(proposed_params, cmb_field, dust_field, data, mask, beam,
+            return eval_gaussian_logposterior(proposed_params, cmb_field, dust_field, data, mask, beam,
                                      noise_covariance, scalar_covariance, tensor_covariance,
                                      frequencies, dust_temperature)
 
@@ -346,6 +476,124 @@ def sample_gaussian_posterior(data, noise_covariance, scalar_covariance, tensor_
         logposterior_values.append(logposterior)
 
         #4. diagnostics for hand-tuning the proposal widths
+        if iteration % log_every == 0:
+            print_acceptance_rates(iteration, acceptance)
+            if out_dir is not None:
+                plot_logposterior(logposterior_values, os.path.join(out_dir, LOGPOSTERIOR_PLOT_FILE))
+                plot_parameter_traces(sample_histories, proposal_widths, out_dir, true_params)
+
+    sample_histories = {name: np.asarray(values) for name, values in sample_histories.items()}
+    acceptance_rates = {name: float(np.mean(accepted)) for name, accepted in acceptance.items()}
+    return sample_histories, acceptance_rates, np.asarray(logposterior_values)
+
+def sample_scattering_posterior(data, noise_covariance, scalar_covariance, tensor_covariance,
+                                mask, beam, param_init, target_log_scattering_coefficients,
+                                scattering_width = DEFAULT_SCATTERING_WIDTH,
+                                proposal_widths = DEFAULT_SCATTERING_PROPOSAL_WIDTHS,
+                                param_bounds = PARAM_BOUNDS,
+                                num_iterations = DEFAULT_NUM_ITERATIONS,
+                                hmc_num_steps = DEFAULT_HMC_NUM_STEPS,
+                                hmc_step_size = DEFAULT_HMC_STEP_SIZE,
+                                seed = DEFAULT_CHAIN_SEED, frequencies = FREQUENCIES_GHZ,
+                                dust_temperature = DUST_TEMPERATURE_K,
+                                log_every = DEFAULT_LOG_EVERY, out_dir = None,
+                                true_params = None):
+    """Gibbs-sample the joint posterior P(f, g, r, frequency_exponent | d) of
+    likelihoods.scattering_posterior, the model whose dust prior is an L2 loss on the log
+    scattering coefficients of g.
+
+    Each iteration draws the CMB field exactly (gibbs_sample_field), updates the dust field
+    with one HMC step (hmc_sample_dust) and updates r and frequency_exponent with a 1D
+    Metropolis step each. The dust field starts at least_squares_dust_field.
+
+    Args:
+        target_log_scattering_coefficients: The target of the dust term, as returned by
+            likelihoods.log_scattering_coefficients.
+        scattering_width: 1-sigma width of the L2 loss on each log coefficient.
+        param_init: {name: value} starting point of r and frequency_exponent.
+        hmc_num_steps: Leapfrog steps of the dust field's HMC update.
+        hmc_step_size: Leapfrog step size, in units where the data's precision on the dust
+            is the mass matrix.
+        The other arguments are those of sample_gaussian_posterior.
+
+    Returns:
+        (sample_histories, acceptance_rates, logposterior_values), as
+        sample_gaussian_posterior, for r and frequency_exponent. acceptance_rates also
+        holds the HMC acceptance rate of the dust field under "dust_field".
+    """
+    frequencies = jnp.asarray(frequencies, dtype = jnp.float64)
+    cmb_frequency_weights = jnp.ones_like(frequencies)
+    response = mask * beam
+
+    #a single-channel zero field: the template of every draw
+    field_shape = data.polar_matrix_1.shape[-2:]
+    zero_matrix = jnp.zeros(field_shape, dtype = data.polar_matrix_1.dtype)
+    field_like = data.replace(polar_matrix_1 = zero_matrix, polar_matrix_2 = zero_matrix)
+
+    params = {name: float(param_init[name]) for name in SCATTERING_PARAM_ORDER}
+    sample_histories = {name: [] for name in SCATTERING_PARAM_ORDER}
+    acceptance = {DUST_FIELD_NAME: [], **{name: [] for name in proposal_widths}}
+    logposterior_values = []
+    rng_key = jax.random.PRNGKey(seed)
+
+    #the scattering coefficients of a zero field are zero, so the dust starts from the
+    #least-squares fit to the data instead. A draw about the fit is used, not the fit
+    #itself: the fit is the peak of the likelihood, where every mode has less energy than a
+    #typical sample, and HMC trajectories that start there are systematically rejected
+    rng_key, key_e, key_b = jax.random.split(rng_key, 3)
+    frequency_scaling = dust_frequency_scaling(frequencies, params["frequency_exponent"],
+                                               dust_temperature)
+    dust_estimate, dust_estimate_covariance = least_squares_dust_field(
+                 data, noise_covariance, mask, beam, frequency_scaling)
+    dust_field = (field_like.replace(polar_matrix_1 = dust_estimate.polar_matrix_1,
+                                     polar_matrix_2 = dust_estimate.polar_matrix_2)
+                  + draw_field(field_like, dust_estimate_covariance, key_e, key_b))
+
+    for iteration in range(1, num_iterations + 1):
+        rng_key, key_cmb, key_dust = jax.random.split(rng_key, 3)
+
+        #the CMB covariance and the dust frequency scaling at the current parameters
+        field_covariance = cmb_field_covariance_from_r(params["r"], scalar_covariance,
+                                                       tensor_covariance)
+        frequency_scaling = dust_frequency_scaling(frequencies, params["frequency_exponent"],
+                                                   dust_temperature)
+
+        #1. draw the CMB field given the dust field
+        dust_data = response * scale_dust_to_frequencies(dust_field, frequency_scaling)
+        cmb_field = gibbs_sample_field(data - dust_data, field_covariance, noise_covariance,
+                                       mask, beam, cmb_frequency_weights, field_like, key_cmb)
+
+        #2. update the dust field given the CMB field with one HMC step, whose mass matrix
+        #is the precision the data puts on the dust
+        mass_matrix = inverse_noise_power(noise_covariance, mask, beam, frequency_scaling)
+        dust_field, dust_accepted = hmc_sample_dust(
+            dust_field, cmb_field, params, data, mask, beam, noise_covariance,
+            scalar_covariance, tensor_covariance, target_log_scattering_coefficients,
+            scattering_width, frequencies, dust_temperature, mass_matrix,
+            hmc_num_steps, hmc_step_size, key_dust)
+        acceptance[DUST_FIELD_NAME].append(bool(dust_accepted))
+
+        #3. update the parameters one at a time at the new fields
+        def logposterior_at(proposed_params):
+            return eval_scattering_logposterior(proposed_params, cmb_field, dust_field, data,
+                                                mask, beam, noise_covariance, scalar_covariance,
+                                                tensor_covariance,
+                                                target_log_scattering_coefficients,
+                                                scattering_width, frequencies, dust_temperature)
+
+        logposterior = float(logposterior_at(params))
+        for name, proposal_width in proposal_widths.items():
+            rng_key, key_param = jax.random.split(rng_key)
+            params, logposterior = metropolis_sample_parameter(logposterior_at, name, params,
+                                                               logposterior, param_bounds[name],
+                                                               proposal_width, acceptance,
+                                                               key_param)
+
+        for name in SCATTERING_PARAM_ORDER:
+            sample_histories[name].append(params[name])
+        logposterior_values.append(logposterior)
+
+        #4. diagnostics for hand-tuning the proposal widths and the HMC step size
         if iteration % log_every == 0:
             print_acceptance_rates(iteration, acceptance)
             if out_dir is not None:

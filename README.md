@@ -9,7 +9,7 @@ Requires Python 3.10 or newer.
 pip install git+https://github.com/zaneblood1/CMBScattering.py.git
 ```
 
-This also installs [CMBLensing.py](https://github.com/zaneblood1/CMBLensing.py) from GitHub, along with its dependencies (JAX, CAMB, ...).
+This also installs [CMBLensing.py](https://github.com/zaneblood1/CMBLensing.py) from GitHub, along with its dependencies (JAX, CAMB, ...), and [Kymatio](https://www.kymat.io/) for the scattering transform.
 
 ```python
 import cmb_scattering
@@ -18,11 +18,12 @@ import cmb_lensing
 
 ## Getting started
 
-The package currently implements a Gaussian dust model: a simulator of three-frequency E + B maps, its log-posterior, and a Gibbs sampler for r and the dust parameters. The scattering transform statistics are not implemented yet.
+The package implements a simulator of three-frequency E + B maps with Gaussian or PySM dust, and two posteriors with a sampler each: a Gaussian dust model (a Gibbs sampler for r and the dust parameters), and a first, exploratory scattering transform model, in which the dust prior is a loss on the wavelet scattering coefficients of the dust map.
 
 - [`docs/01_simulating_data.ipynb`](docs/01_simulating_data.ipynb) simulates a data set and plots its spectra and maps, then shows how the non-Gaussian PySM dust is made (full-sky map, mask, patch, taper). Its last section needs the `pysm` extra.
 - [`docs/02_sampling_gaussian_dust.ipynb`](docs/02_sampling_gaussian_dust.ipynb) runs the sampler on one simulated map and analyses the chain.
 - [`docs/03_sampling_pysm_dust.ipynb`](docs/03_sampling_pysm_dust.ipynb) runs the same Gaussian sampler on data with non-Gaussian PySM dust and on matched Gaussian dust, and compares the recovered r.
+- [`docs/04_scattering_sampler_pysm_dust.ipynb`](docs/04_scattering_sampler_pysm_dust.ipynb) runs the scattering transform sampler and the Gaussian sampler on the same PySM-dust data and compares them.
 
 The sampler also runs from the terminal, simulating its own data. Trace plots and the sample histories go to `gaussian_sampler_output/`:
 
@@ -36,7 +37,7 @@ To test the Gaussian sampler on non-Gaussian dust, the simulated data can use a 
 pip install -e ".[pysm]"
 ```
 
-`python -m cmb_scattering.sampler --help` lists every option. The sampler has only been run on short single-map chains and is not yet validated.
+`python -m cmb_scattering.sampler --help` lists every option. The command line runs the Gaussian sampler only; the scattering sampler is called from Python (`cmb_scattering.sampler.sample_scattering_posterior`). Both samplers have only been run on short single-map chains and are not yet validated.
 
 ## Development
 

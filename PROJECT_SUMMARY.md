@@ -6,7 +6,7 @@ A briefing for AI agents (and new contributors) on what this repository is, how 
 
 Infer the tensor-to-scalar ratio r from flat-sky, multi-frequency CMB polarization maps in the presence of Galactic dust, eventually using scattering transform summary statistics to handle non-Gaussian dust. The package builds on [CMBLensing.py](https://github.com/zaneblood1/CMBLensing.py) (`cmb_lensing`, a JAX port of CMBLensing.jl) and reuses its field and operator types.
 
-## Status (2026-11-17)
+## Status (2026-11-18)
 
 | Part | State |
 |---|---|
@@ -14,14 +14,55 @@ Infer the tensor-to-scalar ratio r from flat-sky, multi-frequency CMB polarizati
 | Gaussian log-posterior (`likelihoods.py`) | implemented, evaluated once on simulated data, not otherwise validated |
 | Gaussian-case sampler (`sampler.py`) | implemented and runs (`docs/02_sampling_gaussian_dust.ipynb`); NOT validated: only short single-map chains so far |
 | PySM (non-Gaussian) dust simulation (`simulate_data(dust_model = "pysm")`) | implemented; one map checked by eye and by its spectrum, and sampled once (`docs/03_sampling_pysm_dust.ipynb`) |
-| Scattering transform statistics, non-Gaussian posterior | not started (see "Planned work") |
+| Scattering transform posterior (`likelihoods.scattering_posterior`) and its sampler (`sampler.sample_scattering_posterior`) | implemented 2026-11-18 and run once (`docs/04_scattering_sampler_pysm_dust.ipynb`); exploratory and NOT validated: the target coefficients are those of the true dust and the loss width is hand-chosen |
 | Tests | two import smoke tests only (`tests/test_import.py`) |
 
 ## Planned work
 
-From `#TODO` comments in the source (2026-11-17):
+### Open points of the scattering posterior (2026-11-18)
 
-- `likelihoods.py`: a non-Gaussian log-posterior built on the L2 loss between the log scattering coefficients of a dust sample and those of the ground-truth dust field.
+The source has no `#TODO` comments left. What the first version of `scattering_posterior` leaves open:
+
+- The loss is not a normalized density, so `frequency_exponent` cannot be sampled with it (see the sampler section). Candidate fix: keep the Gaussian dust prior and add the scattering loss to it.
+- The scattering term had almost no effect on r in the first test. A configuration where the dust prior matters (higher noise, fewer channels, a frequency scaling the sampler does not know) is needed to test it.
+- The target coefficients come from the true dust field of the simulation, including that realization's own fluctuations (the Gaussian-sampler equivalent would be handing it the true band powers). A usable method needs a target from somewhere else (a dust model, other sky, or the synthesis below).
+- **Proposed more agnostic dust term (discussed 2026-11-18, not implemented, not tested):** keep the Gaussian prior with its fitted amplitudes and knees, and add a scattering loss on amplitude-normalized coefficients (ratios such as S2 / S1, unchanged when the dust is rescaled), with the target mean and per-coefficient scatter taken from an ensemble of dust maps that excludes the analysed patch. This would also address the two points above and the width below. First check, not yet done: whether these shape statistics are similar across `d9` patches. Other options considered: a 353 GHz channel in the data vector as the dust tracer, and free target parameters (an overall log amplitude and a tilt), which again need a normalized density.
+- One hand-chosen `scattering_width` for every coefficient. It should follow how much each coefficient varies between dust realizations (large-scale coefficients vary more).
+- E and B are transformed separately; no coefficient couples them.
+- `sample_scattering_posterior` has no command-line entry point (`python -m cmb_scattering.sampler` still runs the Gaussian sampler only) and does not return the sampled dust field.
+
+### Many non-Gaussian dust realizations by synthesis (exploratory, discussed 2026-11-18)
+
+**Status: ideas only.** Nothing below is implemented or tested, the package choices are unverified, and the run-time and memorization statements are estimates. Treat it as a starting point: any part may need changing, and the whole route may be dropped for a different one (the alternatives are listed at the end).
+
+**The problem.** PySM `d9` has no seed, so there is one dust realization. With `d9` fixed and many CMB + noise seeds, the mean of the per-map r estimates measures the bias *conditional on that one dust sky*, and a product of the per-map posteriors is not marginalized over dust. The target plot (scatter of per-map mean r over 100s of maps, Gaussian sampler against non-Gaussian sampler, with z-scores of unit width) needs 100s of statistically equivalent non-Gaussian dust maps.
+
+**The idea.** Synthesize new flat-sky dust maps by gradient descent: start from a random map and minimize the distance between its wavelet statistics and those of a target dust patch. Generate with one statistic family (wavelet phase harmonics, WPH) and infer with the other (scattering coefficients) to reduce circularity. The two families carry much of the same information, so the real `d9` patch, which neither generated, stays the held-out test.
+
+**Flat patch, not full sky.** Synthesize 128 x 128 periodic flat maps directly, instead of synthesizing full-sky maps and cutting patches from them. Reasons: full-sky statistics are dominated by bright low-latitude dust, only about 10 patches of 43 degrees fit per sky, patches at random positions differ in amplitude, and each patch would go through the projection, mask and taper again. FFT-based wavelets give periodic maps, so no taper is needed, and the realizations are identically distributed.
+
+**Proposed loss**, minimized over one two-channel map (Q, U):
+
+    loss = |wavelet stats(synthesis) - wavelet stats(target)|^2      texture
+         + |cross stats between the polarization channels|^2         joint E / B
+         + |binned EE, BB power(synthesis) - target band powers|^2   low-ell power
+
+- **Variables.** Optimize Q and U, where filaments are local, and derive E and B inside the loss with the exact, differentiable Fourier rotation of a periodic flat grid. The texture term acts on the complex field Q + iU.
+- **Joint E / B.** E and B must come from the same descent, since real dust puts correlated structure in both and the Gaussian sampler assumes they are independent. For parity-even dust the EB cross power spectrum is zero, so the cross term has to correlate wavelet *moduli* between channels (|E * psi| with |B * psi| at the same and neighbouring scales). Check: the correlation between smoothed E^2 and B^2 maps should match the `d9` patch (about zero for a Gaussian draw).
+- **Low-ell power.** Wavelet bands are an octave wide and do not fix the spectrum's shape over ell 8 to 150, where the tensor signal is. Add EE and BB band powers in bins about one fundamental wide (delta ell about 8), with the rfft2 Fourier weights, at least up to ell 150, each bin weighted by its variance 2 / (number of modes).
+- **Band-power targets.** Use the smooth power-law fit (the one `docs/03_sampling_pysm_dust.ipynb` makes), multiplied per realization and per bin by a chi-squared draw with that bin's number of modes. The patch's own band powers would copy its particular fluctuations into every map; the smooth fit alone would remove the dust sample variance at low ell and make the scatter of r too small.
+- **Initialization.** Start each descent from a Gaussian draw with the fitted power law (`draw_field`).
+
+**Known risks.**
+
+- *Memorization.* A 128 x 128 map has about 16,000 pixels and a full WPH set can have thousands of coefficients; too many constraints from one target give near-copies of it. Use a reduced statistic set and check that syntheses from different seeds are not strongly correlated with each other or the target.
+- *One target is a noisy estimate.* Averaging the target statistics over several `d9` patches, each normalized to a common amplitude, would help most.
+- *Target edges.* The tapered patch is not a good target (the taper is a strong non-stationary feature), and the untapered patch is discontinuous at its periodic boundary. Some edge handling is needed.
+- *Stationarity.* Synthesized maps are statistically uniform and lose the brightness gradient real dust has across the patch.
+
+**Candidate tools (unverified):** [PyWPH](https://arxiv.org/abs/2102.03160) (Regaldo-Saint Blancard et al. 2021, WPH with cross moments, applied to Planck dust polarization), Kymatio for scattering transforms.
+
+**Alternatives if this does not work out.** (1) Fixed `d9` with many CMB + noise seeds, paired with matched Gaussian dust: needs no new code and gives the conditional bias; worth doing first regardless. (2) More patches of the `d9` sky: about 10 at 43 degrees or 40 to 50 at 20 degrees, with very different amplitudes. (3) Projections of periodic MHD boxes ([Kritsuk, Flauger & Ustyugov 2018](https://arxiv.org/abs/1711.11108)): natively periodic flat maps, tens of realizations, need the simulation data. (4) A toy model, e.g. a Gaussian field times a smooth positive modulation, with the non-Gaussianity as a dial. PySM `d11` and [DustFilaments](https://arxiv.org/abs/2107.08317) are seedable only on small scales, with fixed large scales, so they do not help at the multipoles that constrain r.
 
 ## Layout
 
@@ -29,8 +70,9 @@ From `#TODO` comments in the source (2026-11-17):
 cmb_scattering/
   __init__.py         empty
   simulate_dust.py    the data model: constants, covariances, dust frequency scaling, simulate_data
-  likelihoods.py      gaussian_posterior and the beta_d prior
-  sampler.py          sample_gaussian_posterior (Gibbs over f, g and the six parameters) and its CLI
+  likelihoods.py      gaussian_posterior, scattering_posterior and the beta_d prior
+  sampler.py          sample_gaussian_posterior (Gibbs over f, g and the six parameters) and its CLI;
+                      sample_scattering_posterior (exact f draw, HMC for g, Metropolis for r and beta_d)
 docs/
   01_simulating_data.ipynb   executed guide: simulate a data set and plot spectra and maps; its last
                           section shows the PySM dust step by step (needs the pysm extra)
@@ -38,10 +80,12 @@ docs/
                           acceptance rates, autocorrelation times and KDE posteriors
   03_sampling_pysm_dust.ipynb   executed comparison: the Gaussian sampler on PySM dust
                           against matched Gaussian dust, same CMB and noise
+  04_scattering_sampler_pysm_dust.ipynb   executed comparison: the scattering sampler against the
+                          Gaussian sampler on one PySM-dust data set
 tests/
   test_import.py      import smoke tests
 .claude/skills/update-docs/SKILL.md   the /update-docs command (the only tracked part of .claude/)
-pyproject.toml        setuptools build; depends on cmb-lensing (from GitHub), jax, scipy;
+pyproject.toml        setuptools build; depends on cmb-lensing (from GitHub), jax, scipy, kymatio;
                       optional extras: dev (pytest, jupyter), pysm (pysm3, healpy)
 README.md, CONTRIBUTING.md, CHANGELOG.md, CLAUDE.md, PROJECT_SUMMARY.md
 ```
@@ -78,6 +122,20 @@ Three frequency channels (default 95 / 150 / 220 GHz), polarization only (E and 
 - **The Gaussian model fits PySM dust badly, and steeply.** The sampler's dust knees settle near -1.0 on PySM dust, against -0.70 (EE) and -0.63 (BB) from a binned power-law fit, and the default knee bounds `(-1, 0)` are hit; the notebook widens them to `(-2, 0)` through `param_bounds`. Part of this is the projection: the PySM dust has no power above the grid's axis Nyquist (ell 540) while the grid's corner modes reach 764, and the bilinear lookup smooths small scales. Proposal widths that accept near 44 % at this dust level: amplitudes 0.8 (EE) and 0.4 (BB), knees 0.02, r 0.008, frequency exponent 0.002.
 - **Not validated:** no many-map test that z-scores scatter with unit width has been run. One long chain on one map had `dust_amplitude_ee` 2.6 sigma low at about 90 effective samples; unexplained, possibly chance.
 
+## The scattering posterior and its sampler (exploratory, 2026-11-18)
+
+`likelihoods.scattering_posterior(data_field, cmb_field, dust_field, mask, beam, frequency_exponent, r, noise_covariance, scalar_covariance, tensor_covariance, target_log_scattering_coefficients, scattering_width = 0.1, ...)` is `gaussian_posterior` with the Gaussian dust prior (the `g^2 / C_g` term and its log-determinant) replaced by an L2 loss, `-sum (log S(g) - log S_target)^2 / (2 scattering_width^2)`. It has no dust amplitudes or knees; its parameters are `r` and `frequency_exponent`.
+
+- **Coefficients** (`log_scattering_coefficients(dust_field)`): Kymatio's `Scattering2D` (JAX frontend, Morlet wavelets, `SCATTERING_NUM_SCALES = 5`, `SCATTERING_NUM_ORIENTATIONS = 4`, orders 1 and 2) of the real-space E and B maps separately, averaged over the patch, then the log. Shape `(2, 180)`. The zeroth-order coefficient is dropped. Kymatio pads by reflection, so the transform does not use the maps' periodicity.
+- **Sampler** (`sampler.sample_scattering_posterior(data, noise_covariance, scalar_covariance, tensor_covariance, mask, beam, param_init, target_log_scattering_coefficients, scattering_width, proposal_widths, ..., hmc_num_steps = 10, hmc_step_size = 0.15, ...)`): each iteration draws f exactly (`gibbs_sample_field`), updates g with one HMC step (`hmc_sample_dust`: position = the two real-space dust maps, gradient by `jax.grad`, mass matrix = the data's precision on the dust, `inverse_noise_power`), then 1D Metropolis on the parameters in `proposal_widths`. Returns the same triple as the Gaussian sampler, for `r` and `frequency_exponent`, with the HMC acceptance rate under `"dust_field"`. About 0.47 s per iteration at nside 128 on the user's laptop CPU; HMC accepts about 59 % at the default step.
+- **Start.** g starts from a draw about `least_squares_dust_field` (the joint least-squares fit of f and g to the data, with its covariance), not from zero (log S of a zero map is -inf) and not from the fit itself (see the pitfalls).
+- **Sampling `frequency_exponent` makes the chain run away.** Measured on PySM d9 data (truth beta_d = 1.49, r = 0.03): over 2000 iterations beta_d climbed to 2.4 and r to 0.19 at `scattering_width = 0.1`, and to 2.8 and 0.25 at 0.5, with the log-posterior falling throughout. Cause (reasoned, consistent with the runs, not otherwise proven): the loss constrains 360 numbers of a dust field with 32,768 pixels and is not a normalized density, so it has no counterpart of the Gaussian prior's log-determinant. The data fix `a_freq * g`; lowering `a_freq` (raising beta_d) widens the dust field's conditional by a factor per pixel, and that volume gain outweighs the loss. Hold `frequency_exponent` fixed by leaving it out of `proposal_widths` until the dust term is made a proper density.
+- **First result (2026-11-18, `docs/04_scattering_sampler_pysm_dust.ipynb`: one PySM d9 map at seed 0, 3 uK-arcmin, 1500 iterations per chain, burn-in 200, truth r = 0.03).** With beta_d fixed at the truth: scattering sampler r = 0.0316 +/- 0.0042, Gaussian sampler 0.0326 +/- 0.0042, and a control with the scattering term switched off (`scattering_width = 1e6`, i.e. no dust prior) 0.0321 +/- 0.0047. The Gaussian sampler with beta_d sampled gave 0.0331 +/- 0.0043. All agree within 0.35 sigma. The scattering and the control chain, which share a seed, have r samples correlated at 0.92: **the scattering term has almost no effect on r here**, because the data alone measure the dust well at this noise level. The comparison therefore does not show whether the scattering sampler is less biased; that needs a configuration where the dust prior matters, a target that is not the truth, and many maps.
+- **The coefficients do see the non-Gaussianity.** Against a field with the PySM dust's exact power spectrum and random phases, the first-order log coefficients differ by +0.24 on average and the second-order ones by -0.13 with an rms of 0.42.
+- **The runaway in the notebook:** 700 iterations with beta_d sampled took beta_d to 2.0 and r to 0.11.
+- **The beta_d prior is in `scattering_posterior` but cannot stop the runaway.** Hand estimate (2026-11-18, order of magnitude, not measured): the volume gain is about 32,768 x |ln(220 / 353)| = 15,000 nats per unit of beta_d, against a prior pull of (beta_d - 1.49) / 0.13^2, about 8 nats per unit at 1 sigma. At beta_d = 2.4 the volume gain is about 14,000 nats, the scattering loss costs about 3,300 (360 coefficients, width 0.1) and the prior about 25.
+- **Do not read structure into the r densities of that notebook.** The scattering chain's KDE shows two bumps (r near 0.0295 and 0.034, dip about 5 % of the peak). It is drawn from 163 thinned samples, where the density at the peak is uncertain by roughly 10 % (estimate), and the no-prior chain, which shares the seed, shows the same shoulder. A longer chain or other sampler seeds on the same map would settle it; neither has been run.
+- **The Gaussian chains may not be converged at 1500 iterations:** by eye, the log-posterior of the chain with beta_d sampled is still rising slowly after iteration 800, in line with the slow dust-parameter mixing measured above.
 ## Representation and conventions
 
 - **Fields** are `cmb_lensing.fields.FlatS2` in EB parametrization and Fourier basis: E in `polar_matrix_1`, B in `polar_matrix_2`, each an `(nside, nside//2+1)` rfft2 array.
@@ -99,6 +157,8 @@ Three frequency channels (default 95 / 150 / 220 GHz), polarization only (E and 
 - **PySM geometry is approximate.** The longitude / latitude layout distorts a 43 degree patch by up to about 7 % at its edges, and its corners reach Galactic latitude -33.5 deg, just above the mask's ramp. A different patch centre or a larger patch needs the mask latitudes checked. healpy's B sign convention may differ from cmb_lensing's.
 - **First PySM call downloads templates** (the nside 2048 GNILC dust map) into the astropy cache and took about a minute; later calls in the same process reuse a cached result and take about a second.
 - **Averaging over rfft2 modes needs the Fourier weights.** A band power or any other average over the Fourier plane must weight each rfft2 entry by `get_fourier_weights` (2 in the bulk, 1 in the two self-conjugate columns). An unweighted mean double-counts the kx = 0 column, which for the PySM dust (brighter toward one edge) is not a harmless choice: it moved the fitted BB dust knee from -0.63 to -0.68.
+- **`import kymatio.jax` fails** on current scipy: kymatio 0.3.0's top-level JAX module also imports its 3D transform, which needs `scipy.special.sph_harm` (removed). `likelihoods.py` imports `ScatteringJax2D` from `kymatio.scattering2d.frontend.jax_frontend` instead. kymatio 0.3.0 is the newest release (2022).
+- **HMC must not start at the likelihood peak.** Started exactly at the least-squares dust, every HMC proposal was rejected: each mode starts with less potential energy than a typical sample, the trajectory always gains potential energy, and the leapfrog energy error has one sign (about -31 at step 0.15). The sampler therefore starts from a draw about the fit.
 - **Private imports.** `simulate_dust.py` imports `_run_camb` and `_CAMB_COLS` from `cmb_lensing.simulate`. A rename there breaks `cmb_covariances`.
 - **Scalar times operator.** Write `operator * r`, not `r * operator`, so the operator's own `__mul__` handles a JAX scalar.
 - **Default-sized objects.** A bare `FlatS2()` or `DiagonalEB()` has nside 256 arrays and weights. Always pass `nside`, `theta_pix`, `pix_width` and `fourier_weights = get_fourier_weights((nside, nside//2+1))`, or build from an existing object with `.replace(...)`.
