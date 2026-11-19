@@ -112,7 +112,10 @@ def scattering_posterior(data_field, cmb_field, dust_field, mask, beam,
                          noise_covariance, scalar_covariance, tensor_covariance,
                          target_log_scattering_coefficients,
                          scattering_width = DEFAULT_SCATTERING_WIDTH,
-                         frequencies = FREQUENCIES_GHZ, dust_temperature = DUST_TEMPERATURE_K):
+                         frequencies = FREQUENCIES_GHZ, dust_temperature = DUST_TEMPERATURE_K,
+                         gaussian_dust_prior = False,
+                         dust_amplitude_ee = None, dust_knee_ee = None,
+                         dust_amplitude_bb = None, dust_knee_bb = None):
     """Joint log-density of the data, the CMB field f and the dust field g, in which the
     Gaussian dust prior of gaussian_posterior is replaced by an L2 loss between the log
     scattering coefficients of g and a target set.
@@ -123,9 +126,16 @@ def scattering_posterior(data_field, cmb_field, dust_field, mask, beam,
             + sum_over_coefficients {(log S(g) - log S_target)^2} / scattering_width^2]
             + frequency_exponent_logprior(frequency_exponent)
 
-    The dust term has no free parameters (no amplitudes or knees), so its normalization is
-    a constant and is left out. `target_log_scattering_coefficients` has the shape
-    log_scattering_coefficients returns. The other arguments are those of gaussian_posterior.
+    The scattering term has no free parameters (no amplitudes or knees), so its
+    normalization is a constant and is left out. `target_log_scattering_coefficients` has
+    the shape log_scattering_coefficients returns. The other arguments are those of
+    gaussian_posterior.
+
+    `gaussian_dust_prior = True` keeps the Gaussian dust prior of gaussian_posterior as well,
+    adding g^2 / C_g + logdet(C_g) inside the brackets, so the scattering loss multiplies a
+    normalized density of g. The four dust amplitude / knee arguments are needed only then.
+    The integral of that product over g still depends on the dust parameters and is not
+    divided out.
     """
     field_covariance = cmb_field_covariance_from_r(r, scalar_covariance, tensor_covariance)
     frequency_scaling = dust_frequency_scaling(frequencies, frequency_exponent, dust_temperature)
@@ -145,6 +155,16 @@ def scattering_posterior(data_field, cmb_field, dust_field, mask, beam,
     scattering_difference = log_scattering_coefficients(dust_field) - target_log_scattering_coefficients
     scattering_loss = jnp.sum(scattering_difference**2) / scattering_width**2
 
-    value = -(jnp.real(data_product + field_product + noise_logdet + field_logdet) + scattering_loss) / 2
+    #the optional Gaussian dust prior, with its log-determinant
+    gaussian_dust_term = 0.0
+    if gaussian_dust_prior:
+        dust_covariance = dust_covariance_operator_like(dust_amplitude_ee, dust_knee_ee,
+                                                        dust_amplitude_bb, dust_knee_bb,
+                                                        scalar_covariance)
+        gaussian_dust_term = jnp.real(dot(dust_field, pinv(dust_covariance) * dust_field)
+                                      + log_det(dust_covariance))
+
+    value = -(jnp.real(data_product + field_product + noise_logdet + field_logdet)
+              + scattering_loss + gaussian_dust_term) / 2
     #the Gaussian prior on the frequency exponent
     return value + frequency_exponent_logprior(frequency_exponent)

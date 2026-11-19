@@ -2,7 +2,7 @@
 
 Thanks for your interest in CMBScattering.py. Bug reports, questions, documentation fixes and code contributions are all welcome. This page explains how to get help, how to report a problem, and how to propose a change.
 
-CMBScattering.py infers the tensor-to-scalar ratio from flat-sky, multi-frequency CMB polarization maps with a dust foreground. It builds on [CMBLensing.py](https://github.com/zaneblood1/CMBLensing.py). `PROJECT_SUMMARY.md` describes the data model, the code layout and the conventions. Four executed notebooks are worked examples: `docs/01_simulating_data.ipynb` simulates and plots a data set, with Gaussian and with PySM dust (its last section needs the `pysm` extra), `docs/02_sampling_gaussian_dust.ipynb` runs the Gaussian dust sampler on one, `docs/03_sampling_pysm_dust.ipynb` compares that sampler on PySM dust and on Gaussian dust, and `docs/04_scattering_sampler_pysm_dust.ipynb` compares it with the scattering transform sampler on PySM dust (the last two need the `pysm` extra; the last takes about 30 minutes to execute).
+CMBScattering.py infers the tensor-to-scalar ratio from flat-sky, multi-frequency CMB polarization maps with a dust foreground. It builds on [CMBLensing.py](https://github.com/zaneblood1/CMBLensing.py). `PROJECT_SUMMARY.md` describes the data model, the code layout and the conventions. Five executed notebooks are worked examples (the fifth, `docs/05_scattering_with_gaussian_prior.ipynb`, tests the scattering sampler with a Gaussian dust prior added; it needs the `pysm` extra and takes about 10 minutes to execute): `docs/01_simulating_data.ipynb` simulates and plots a data set, with Gaussian and with PySM dust (its last section needs the `pysm` extra), `docs/02_sampling_gaussian_dust.ipynb` runs the Gaussian dust sampler on one, `docs/03_sampling_pysm_dust.ipynb` compares that sampler on PySM dust and on Gaussian dust, and `docs/04_scattering_sampler_pysm_dust.ipynb` compares it with the scattering transform sampler on PySM dust (the last two need the `pysm` extra; the last takes about 30 minutes to execute).
 
 ## Getting help
 
@@ -62,6 +62,7 @@ The test suite currently only checks that the package and its CMBLensing.py depe
    jupyter nbconvert --to notebook --execute --inplace docs/02_sampling_gaussian_dust.ipynb
    jupyter nbconvert --to notebook --execute --inplace docs/03_sampling_pysm_dust.ipynb
    jupyter nbconvert --to notebook --execute --inplace --ExecutePreprocessor.timeout=-1 docs/04_scattering_sampler_pysm_dust.ipynb
+   jupyter nbconvert --to notebook --execute --inplace --ExecutePreprocessor.timeout=-1 docs/05_scattering_with_gaussian_prior.ipynb
    ```
 
 5. Add an entry to `CHANGELOG.md`, and update `PROJECT_SUMMARY.md` if the structure, a function signature or a convention changed. If you use Claude Code, `/update-docs` does this.
