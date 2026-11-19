@@ -25,6 +25,7 @@ The package implements a simulator of three-frequency E + B maps with Gaussian o
 - [`docs/03_sampling_pysm_dust.ipynb`](docs/03_sampling_pysm_dust.ipynb) runs the same Gaussian sampler on data with non-Gaussian PySM dust and on matched Gaussian dust, and compares the recovered r.
 - [`docs/04_scattering_sampler_pysm_dust.ipynb`](docs/04_scattering_sampler_pysm_dust.ipynb) runs the scattering transform sampler and the Gaussian sampler on the same PySM-dust data and compares them.
 - [`docs/05_scattering_with_gaussian_prior.ipynb`](docs/05_scattering_with_gaussian_prior.ipynb) tests the scattering sampler with the Gaussian dust prior kept next to the scattering loss (`gaussian_dust_prior = True`), with the dust frequency exponent sampled.
+- [`docs/06_mask_and_beam.ipynb`](docs/06_mask_and_beam.ipynb) adds an apodized border mask and a BICEP3 beam (`cmb_scattering.instrument`), shows the data built up one component at a time, and samples it.
 
 The sampler also runs from the terminal, simulating its own data. Trace plots and the sample histories go to `gaussian_sampler_output/`:
 

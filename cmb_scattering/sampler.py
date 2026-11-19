@@ -12,8 +12,10 @@ Each iteration of sample_gaussian_posterior
 
 The field draws use the Hoffman-Ribak algorithm: simulate a field and a noise realization
 from their priors, then add the Wiener filter of the difference between the real and the
-simulated data. Every operator of the model is diagonal in Fourier space, so the Wiener
-filter is solved exactly mode by mode (wiener_filter) instead of by conjugate gradient.
+simulated data. With a mask and a beam that are diagonal in Fourier space (the default
+identity, or any DiagonalEB) every operator of the model is, and the Wiener filter is solved
+exactly mode by mode (wiener_filter). A pixel-space mask (instrument.PixelMask) is not, and
+the Wiener filter is then solved by conjugate gradient (conjugate_gradient_wiener_filter).
 
 Run from the terminal with, e.g.,
 
@@ -36,10 +38,11 @@ import os
 import jax
 import jax.numpy as jnp
 import jax.numpy.fft as jfft
+import jax.scipy.sparse.linalg
 import numpy as np
 jax.config.update("jax_enable_x64", True)
 from matplotlib.figure import Figure
-from cmb_lensing.matrix_operators import get_identity_like, pinv
+from cmb_lensing.matrix_operators import DiagonalEB, get_identity_like, pinv
 from cmb_scattering.likelihoods import (DEFAULT_SCATTERING_WIDTH, FREQUENCY_EXPONENT_PRIOR_MEAN,
                                         gaussian_posterior, scattering_posterior)
 from cmb_scattering.simulate_dust import (DEFAULT_PYSM_PRESET, DEFAULT_UK_ARCMIN,
@@ -50,7 +53,7 @@ from cmb_scattering.simulate_dust import (DEFAULT_PYSM_PRESET, DEFAULT_UK_ARCMIN
                                           cmb_field_covariance_from_r,
                                           dust_covariance_operator_like,
                                           dust_frequency_scaling, draw_field, draw_noise,
-                                          scale_dust_to_frequencies, simulate_data)
+                                          simulate_data)
 
 #the sampled parameters, in the order they are updated in each iteration
 PARAM_ORDER = ["dust_amplitude_ee", "dust_amplitude_bb", "dust_knee_ee", "dust_knee_bb",
@@ -90,6 +93,10 @@ DEFAULT_SCATTERING_PROPOSAL_WIDTHS = {
 #data's precision on the dust, so a step size of one is one natural time unit of every mode
 DEFAULT_HMC_NUM_STEPS = 10
 DEFAULT_HMC_STEP_SIZE = 0.15
+#relative residual at which the conjugate-gradient Wiener filter of a pixel mask stops, and
+#its cap on the number of iterations
+CONJUGATE_GRADIENT_TOLERANCE = 1e-6
+CONJUGATE_GRADIENT_MAX_ITERATIONS = 500
 #the name the dust field's HMC acceptance rate is reported under
 DUST_FIELD_NAME = "dust_field"
 
@@ -149,16 +156,81 @@ def sum_over_frequencies(field_or_operator):
                for name in field_or_operator._matrix_names()}
     return field_or_operator.replace(**updates)
 
+def apply_response(field, mask, beam, frequency_weights):
+    """R * field with R_freq = frequency_weights_freq * M * B: a single-channel field as it
+    enters the data of every channel (leading frequency axis)."""
+    return mask * (beam * scale_by_frequency(field, frequency_weights))
+
+def diagonal_response(mask, beam):
+    """M * B as a DiagonalEB. A pixel mask is not diagonal in Fourier space and is replaced
+    by its rms, which is only good enough for a preconditioner, an HMC mass matrix or a
+    starting point."""
+    if isinstance(mask, DiagonalEB):
+        return mask * beam
+    return beam * jnp.sqrt(jnp.mean(mask.pixel_map**2))
+
 def inverse_noise_power(noise_covariance, mask, beam, frequency_weights):
     """sum_freq R N^-1 R with R_freq = frequency_weights_freq * M * B: the precision the
-    data alone puts on a field that enters channel `freq` through R_freq."""
-    response = scale_by_frequency(mask * beam, frequency_weights)
+    data alone puts on a field that enters channel `freq` through R_freq. Exact for a
+    Fourier-diagonal mask, an approximation for a pixel mask (diagonal_response)."""
+    response = scale_by_frequency(diagonal_response(mask, beam), frequency_weights)
     return sum_over_frequencies(response * pinv(noise_covariance) * response)
 
 def inverse_noise_weighted_data(data, noise_covariance, mask, beam, frequency_weights):
-    """sum_freq R N^-1 data_freq with R_freq = frequency_weights_freq * M * B."""
-    response = scale_by_frequency(mask * beam, frequency_weights)
+    """sum_freq R N^-1 data_freq with R_freq = frequency_weights_freq * M * B, with the same
+    approximation for a pixel mask as inverse_noise_power."""
+    response = scale_by_frequency(diagonal_response(mask, beam), frequency_weights)
     return sum_over_frequencies(response * (pinv(noise_covariance) * data))
+
+def conjugate_gradient_wiener_filter(data, prior_covariance, noise_covariance, mask, beam,
+                                     frequency_weights):
+    """wiener_filter for a mask that is not diagonal in Fourier space, by preconditioned
+    conjugate gradient on the real-space maps.
+
+    Solves (1 + C^1/2 R^T N^-1 R C^1/2) y = C^1/2 R^T N^-1 data and returns C^1/2 y, the
+    form in which modes with no prior power come out exactly zero. R^T is the transpose of
+    the response, taken by JAX. The preconditioner is the exact solution for the
+    Fourier-diagonal stand-in of the mask.
+    """
+    field_shape = data.polar_matrix_1.shape[-2:]
+    zero_matrix = jnp.zeros(field_shape, dtype = data.polar_matrix_1.dtype)
+    field_like = data.replace(polar_matrix_1 = zero_matrix, polar_matrix_2 = zero_matrix)
+    sqrt_covariance = prior_covariance.replace(matrix_EE = jnp.sqrt(prior_covariance.matrix_EE),
+                                               matrix_BB = jnp.sqrt(prior_covariance.matrix_BB))
+    inverse_noise = pinv(noise_covariance)
+
+    def scale_by_sqrt_covariance(maps):
+        return field_to_maps(sqrt_covariance * maps_to_field(maps, field_like))
+
+    def response(maps):
+        return field_to_maps(apply_response(maps_to_field(maps, field_like), mask, beam,
+                                            frequency_weights))
+
+    def response_transpose(data_maps):
+        example_input = field_to_maps(field_like)                          
+        transpose_function = jax.linear_transpose(response, example_input) 
+        (result,) = transpose_function(data_maps)                          
+        return result
+    
+    def weight_by_inverse_noise(data_maps):
+        return field_to_maps(inverse_noise * maps_to_field(data_maps, data))
+
+    def system(maps):
+        data_maps = weight_by_inverse_noise(response(scale_by_sqrt_covariance(maps)))
+        return maps + scale_by_sqrt_covariance(response_transpose(data_maps))
+
+    data_precision = inverse_noise_power(noise_covariance, mask, beam, frequency_weights)
+    inverse_diagonal = pinv(get_identity_like(prior_covariance) + prior_covariance * data_precision)
+
+    def preconditioner(maps):
+        return field_to_maps(inverse_diagonal * maps_to_field(maps, field_like))
+
+    right_hand_side = scale_by_sqrt_covariance(
+                      response_transpose(weight_by_inverse_noise(field_to_maps(data))))
+    solution, _ = jax.scipy.sparse.linalg.cg(system, right_hand_side, M = preconditioner,
+                                             tol = CONJUGATE_GRADIENT_TOLERANCE,
+                                             maxiter = CONJUGATE_GRADIENT_MAX_ITERATIONS)
+    return maps_to_field(scale_by_sqrt_covariance(solution), field_like)
 
 def wiener_filter(data, prior_covariance, noise_covariance, mask, beam, frequency_weights):
     """Wiener filter of multi-frequency data for a field x with x ~ N(0, C) and
@@ -166,9 +238,13 @@ def wiener_filter(data, prior_covariance, noise_covariance, mask, beam, frequenc
 
     Returns C * (1 + C * sum_freq R N^-1 R)^-1 * sum_freq R N^-1 data_freq, which is the
     usual (C^-1 + sum_freq R N^-1 R)^-1 * sum_freq R N^-1 data_freq written so that modes
-    with no prior power come out exactly zero. The mask and the beam are taken to be real
-    and diagonal in Fourier space, so the solve is exact.
+    with no prior power come out exactly zero. For a mask and a beam that are real and
+    diagonal in Fourier space the solve is exact; any other mask (an instrument.PixelMask)
+    goes to conjugate_gradient_wiener_filter.
     """
+    if not isinstance(mask, DiagonalEB):
+        return conjugate_gradient_wiener_filter(data, prior_covariance, noise_covariance,
+                                                mask, beam, frequency_weights)
     data_precision = inverse_noise_power(noise_covariance, mask, beam, frequency_weights)
     weighted_data = inverse_noise_weighted_data(data, noise_covariance, mask, beam,
                                                 frequency_weights)
@@ -189,8 +265,8 @@ def gibbs_sample_field(data_residual, prior_covariance, noise_covariance, mask, 
     #simulate x' ~ N(0, C) and n' ~ N(0, C_n), and the data they would give
     simulated_field = draw_field(field_like, prior_covariance, key_e, key_b)
     simulated_noise = draw_noise(field_like, noise_covariance, key_noise)
-    response = scale_by_frequency(mask * beam, frequency_weights)
-    simulated_data = response * simulated_field + simulated_noise
+    simulated_data = (apply_response(simulated_field, mask, beam, frequency_weights)
+                      + simulated_noise)
 
     #x = x' + W * (d - d')
     correction = wiener_filter(data_residual - simulated_data, prior_covariance,
@@ -424,7 +500,6 @@ def sample_gaussian_posterior(data, noise_covariance, scalar_covariance, tensor_
     """
     frequencies = jnp.asarray(frequencies, dtype = jnp.float64)
     cmb_frequency_weights = jnp.ones_like(frequencies)
-    response = mask * beam
 
     #a single-channel zero field: the template of every draw and the starting dust field
     field_shape = data.polar_matrix_1.shape[-2:]
@@ -453,12 +528,12 @@ def sample_gaussian_posterior(data, noise_covariance, scalar_covariance, tensor_
                                                    dust_temperature)
 
         #1. draw the CMB field given the dust field
-        dust_data = response * scale_dust_to_frequencies(dust_field, frequency_scaling)
+        dust_data = apply_response(dust_field, mask, beam, frequency_scaling)
         cmb_field = gibbs_sample_field(data - dust_data, field_covariance, noise_covariance,
                                        mask, beam, cmb_frequency_weights, field_like, key_cmb)
 
         #2. draw the dust field given the CMB field
-        cmb_data = response * cmb_field
+        cmb_data = apply_response(cmb_field, mask, beam, cmb_frequency_weights)
         dust_field = gibbs_sample_field(data - cmb_data, dust_covariance, noise_covariance,
                                         mask, beam, frequency_scaling, field_like, key_dust)
 
@@ -537,7 +612,6 @@ def sample_scattering_posterior(data, noise_covariance, scalar_covariance, tenso
     """
     frequencies = jnp.asarray(frequencies, dtype = jnp.float64)
     cmb_frequency_weights = jnp.ones_like(frequencies)
-    response = mask * beam
 
     #a single-channel zero field: the template of every draw
     field_shape = data.polar_matrix_1.shape[-2:]
@@ -577,7 +651,7 @@ def sample_scattering_posterior(data, noise_covariance, scalar_covariance, tenso
                                                    dust_temperature)
 
         #1. draw the CMB field given the dust field
-        dust_data = response * scale_dust_to_frequencies(dust_field, frequency_scaling)
+        dust_data = apply_response(dust_field, mask, beam, frequency_scaling)
         cmb_field = gibbs_sample_field(data - dust_data, field_covariance, noise_covariance,
                                        mask, beam, cmb_frequency_weights, field_like, key_cmb)
 

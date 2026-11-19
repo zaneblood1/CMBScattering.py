@@ -7,9 +7,10 @@
     n_freq ~ N(0, C_n)    the noise, independent between channels
 
 Fields are cmb_lensing FlatS2 objects (EB, Fourier space) and operators are DiagonalEB.
-Anything with one entry per channel (the data, the noise covariance and, in the future, the
-mask and the beam) carries a leading frequency axis, (n_freq, nside, nside//2+1). The field
-and operator arithmetic of cmb_lensing is element-wise, so it broadcasts over that axis.
+Anything with one entry per channel (the data, the noise covariance and, optionally, the
+beam or a Fourier-space mask) carries a leading frequency axis, (n_freq, nside, nside//2+1).
+The field and operator arithmetic of cmb_lensing is element-wise, so it broadcasts over that
+axis. The mask M and the beam B default to the identity; instrument.py builds others.
 """
 
 from functools import lru_cache
@@ -217,8 +218,9 @@ def scale_dust_to_frequencies(dust_field, frequency_scaling):
 def data_model(cmb_field, dust_field, frequency_scaling, mask, beam):
     """The noise-free data of every channel, M * B * (f + a_freq * g)."""
     dust_by_frequency = scale_dust_to_frequencies(dust_field, frequency_scaling)
-    #the dust goes on the left so the sum takes its (n_freq, nside, nside//2+1) shape
-    return mask * beam * (dust_by_frequency + cmb_field)
+    #the dust goes on the left so the sum takes its (n_freq, nside, nside//2+1) shape. The
+    #beam and then the mask act on the field, so a mask need not be diagonal in Fourier space
+    return mask * (beam * (dust_by_frequency + cmb_field))
 
 ##############################################################
 #PYSM DUST
@@ -351,7 +353,8 @@ def simulate_data(nside, theta_pix, master_seed, r, frequency_exponent,
                   uk_arcmin = DEFAULT_UK_ARCMIN,
                   frequencies = FREQUENCIES_GHZ, dust_temperature = DUST_TEMPERATURE_K,
                   params = GROUND_TRUTH, dust_model = GAUSSIAN_DUST,
-                  pysm_preset = DEFAULT_PYSM_PRESET):
+                  pysm_preset = DEFAULT_PYSM_PRESET, mask = None, beam = None,
+                  pysm_taper_fraction = None):
     """Simulate multi-frequency E + B data on a flat nside x nside patch.
 
     Args:
@@ -375,6 +378,15 @@ def simulate_data(nside, theta_pix, master_seed, r, frequency_exponent,
             field (pysm_dust_field): non-Gaussian, and the same on every call, so the seed
             then only changes the CMB and the noise.
         pysm_preset: The PySM dust model of dust_model = "pysm".
+        mask: The mask M of the data model, a DiagonalEB or an instrument.PixelMask. None is
+            the identity. The noise is not masked.
+        beam: The beam B of the data model, a DiagonalEB (e.g. instrument.gaussian_beam).
+            None is the identity.
+        pysm_taper_fraction: Fraction of the patch width over which the PySM dust is tapered
+            to zero at the edges; zero leaves it untapered. None tapers it by
+            PYSM_TAPER_FRACTION under a Fourier-diagonal mask (including the identity) and
+            not at all under a pixel mask, which is expected to go to zero at the edges
+            itself.
 
     Returns:
         A dict with the fields `data` (leading frequency axis), `cmb_field` and `dust_field`,
@@ -389,9 +401,14 @@ def simulate_data(nside, theta_pix, master_seed, r, frequency_exponent,
     scalar_covariance, tensor_covariance = cmb_covariances(nside, theta_pix, params)
     field_covariance = cmb_field_covariance_from_r(r, scalar_covariance, tensor_covariance)
     noise_covariance = white_noise_covariance(nside, theta_pix, uk_arcmin, frequencies.shape[0])
-    #identity for now: a per-channel mask or beam is a block with a leading frequency axis
-    mask = get_identity_like(scalar_covariance)
-    beam = get_identity_like(scalar_covariance)
+    #the identity unless the caller passes their own (see instrument.py)
+    if mask is None:
+        mask = get_identity_like(scalar_covariance)
+    if beam is None:
+        beam = get_identity_like(scalar_covariance)
+    #a pixel mask replaces the PySM dust's own edge taper
+    if pysm_taper_fraction is None:
+        pysm_taper_fraction = PYSM_TAPER_FRACTION if isinstance(mask, DiagonalEB) else 0.0
 
     field_like = FlatS2(fourier_weights = get_fourier_weights(ell_grid.shape), nside = nside,
                         theta_pix = theta_pix, pix_width = pix_width, basis = Basis.FOURIER,
@@ -403,7 +420,7 @@ def simulate_data(nside, theta_pix, master_seed, r, frequency_exponent,
     #the dust at the reference frequency
     if dust_model == PYSM_DUST:
         dust_covariance = None
-        dust_field = pysm_dust_field(field_like, pysm_preset)
+        dust_field = pysm_dust_field(field_like, pysm_preset, pysm_taper_fraction)
     else:
         dust_covariance = dust_covariance_operator_like(dust_amplitude_ee, dust_knee_ee,
                                                         dust_amplitude_bb, dust_knee_bb,
